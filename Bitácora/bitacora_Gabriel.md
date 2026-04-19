@@ -43,3 +43,33 @@ ERROR:  OE-core's config sanity checker detected a potential misconfiguration.
     MACHINE=jetson-nano-devkit is invalid. Please set a valid MACHINE in your local.conf, environment or other configuration file.
 Summary: There was 1 ERROR message, returning a non-zero exit code.
 ```
+
+
+## **Fecha: 19/04/2026**
+
+- Se verifica que a lo largo de la noche se genera la imagen de manera satisfactoria. Esta se encuentra dentro del contenedor, específicamente en la ruta:
+
+```bash
+yocto-workspace/
+└── poky/
+    └── build-jetson/
+        └── tmp/
+            └── deploy/
+                └── images/
+                    └── jetson-nano-devkit/
+                        └── core-image-base-jetson-nano-devkit.tegraflash.tar.gz
+```
+
+- Investigando, para poder hacer que la Jetson Nano bootee la nueva imagen, hay que hacer que esta se encienda en *Recovery mode*, para lo que hay que colocar un jumper en los pines J28. En este momento no se tiene el jumper, por lo que simplemente se decide cargar la imagen a una tarjeta SD de 64 GB usando [Etcher](https://etcher.balena.io/#download-etcher).
+
+- Al tratar de hacer el boot con Etcher, se ve que este da una advertencia. Parece que no se puede copiar directamente la imagen de esta forma, sino que hay que hacerlo por medio de un cable USB conectado entre la computadora host y le Jetson Nano.
+
+### Errores / Problemas
+
+- No se puede copiar la imagen a la SD.
+
+<figure style="text-align: center; margin: 20px auto;">
+  <img src="Imágenes/Error_Etcher.png" alt="Placeholder" 
+       style="width: 700px; height: auto; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+  <figcaption style="font-style: italic; color: #666;">Error al pasar la imagen a la SD con Balena Etcher</figcaption>
+</figure>
