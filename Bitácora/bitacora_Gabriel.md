@@ -73,3 +73,92 @@ yocto-workspace/
        style="width: 700px; height: auto; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
   <figcaption style="font-style: italic; color: #666;">Error al pasar la imagen a la SD con Balena Etcher</figcaption>
 </figure>
+
+
+## **Fecha: 23/04/2026**
+
+- Investigando de manera algo más profunda, parece que no es necesario poner un jumper físico en la jetson nano, para hacer que esta bootee con una imagen nueva. El poner un jumper en el pin J28 más bien lo que hace es indicarle a la tarjeta que debe alimentarse con el cable de tipo barril, y no con el micro-usb. Actualmente solo se cuenta con el micro-usb, por lo que hay que usar este como alimentación.
+- Investigando en la (documentación){} oficial, al flashear la imagen que provee Nvidia, hay que usar un monitor, mouse y teclado para configurar algunas cosas. Se cree que dado que se usa una imagen personalizada, esto no va a ser necesario.
+- Dado que la vez pasada no se pudo flashear la SD con el etcher, se debe de alterar el contenido del `local.conf` para que este genere un archivo compatible con este software. Inicialmente se añadió la línea `IMAGE_FSTYPES:append = "wic.gz"`, pero esta daba un error, que se muestra en seguida:
+
+```bash
+ERROR: tegra-minimal-initramfs-1.0-r0 do_image_wic: No kickstart files from WKS_FILES were found: tegra-minimal-initramfs.jetson-nano-devkit.wks tegra-minimal-initramfs.wks. Please set WKS_FILE or WKS_FILES appropriately.
+```
+- Daba este y errores relacionados con una incapacidad de usar el tipo de archivo wic. Esto se trató de modificar para que funcionara, pero no se logró solucionar.
+- Se vió que al tener el `local.conf` con este contenido, esta va a generar un archivo comprimido que después se puede modificar para generar la imagen.
+
+```bash
+IMAGE_CLASSES_append = " image_types_tegra"
+
+IMAGE_FSTYPES_pn-core-image-base = " tegraflash tar.gz"
+
+WKS_FILE_pn-core-image-base = ""
+```
+
+- Una vez se acabó el `bitbake core-image-base`, se generá el archivo `core-image-base-jetson-nano-devkit-20260423214527.tegraflash.tar.gz`. Este hay que copiarlo y pegarlo fuera del contenedor de docker. Una vez fuera, se descomprime y se debe de correr el siguiente comando:
+
+```bash
+sudo ./dosdcard.sh jetson-nano-sdcard.img
+```
+
+- Esto va a tomar los archivos relevantes de la carpeta recién descomprimida y los va a unificar en `jetson-nano-sdcard.img`, la cual se puede bootear a la SD usando etcher.
+- Ya con la SD correctamente flasheada, esta se coloca dentro de la jetson nano. Inicialmente esta tarjeta no parece funcionar, al conectarla al router, no aparecen señales de que se esté conectando a este. Luego de ajustar algunos paquetes dentro del archivo de configuraciones, se logra que la tarjeta se vuelva visible, esto se verifica con:
+
+```bash
+# Comando para ver dispositivos visibles
+for i in {1..254}; do ping -c 1 -W 1 192.168.100.$i | grep "from"; done
+64 bytes from 192.168.100.1: icmp_seq=1 ttl=64 time=4.66 ms
+64 bytes from 192.168.100.3: icmp_seq=1 ttl=64 time=0.063 ms
+64 bytes from 192.168.100.9: icmp_seq=1 ttl=64 time=207 ms
+# La primera dirección corresponder al router, la segunda a la computadora local y la tercera a la jetson nano
+```
+
+- El archivo `local.conf` tiene el contenido final tal que:
+
+```bash
+# Limitar el uso de CPU durante la construcción
+BB_NUMBER_PARSE_THREADS ?= "1"
+BB_NUMBER_THREADS ?= "2"
+PARALLEL_MAKE ?= "-j 2"
+
+# 1. Acceso y Tweaks
+EXTRA_IMAGE_FEATURES += "debug-tweaks ssh-server-openssh"
+
+# 2. Instalación de paquetes (Sintaxis Dunfell)
+IMAGE_INSTALL_append = " \
+    ollama-bin \
+    openssh-sftp-server \
+    packagegroup-core-full-cmdline \
+    kernel-modules \
+    linux-firmware-rtl8168 \
+"
+
+# 3. Forzar el uso de systemd y sus servicios de red
+DISTRO_FEATURES_append = " systemd"
+VIRTUAL-RUNTIME_init_manager = "systemd"
+DISTRO_FEATURES_BACKFILL_CONSIDERED = "sysvinit"
+VIRTUAL-RUNTIME_initscripts = "systemd-compat-units"
+
+# 4. Habilitar red automática sin funciones de shell complejas
+# Esto le dice a systemd-networkd que se compile y use
+PACKAGECONFIG_append_pn-systemd = " networkd resolved"
+
+# 5. Configuración de hardware (Lo que ya tenías)
+IMAGE_CLASSES_append = " image_types_tegra"
+IMAGE_FSTYPES_pn-core-image-base = " tegraflash tar.gz"
+WKS_FILE_pn-core-image-base = ""
+LICENSE_FLAGS_ACCEPTED += "commercial"
+```
+
+- No obstante, al tratar de realizar la conexión, esta falla.
+
+### Errores / Problemas
+
+- Error con el formato `IMAGE_FSTYPES:append = "wic.gz"` dentro del `local.conf`, esto para crear la imagen directamente booteable con etcher.
+- Conexión fallida con la jetson.
+
+```bash
+ssh root@192.168.100.9
+# Resultado
+ssh: connect to host 192.168.100.9 port 22: Connection refused
+```
