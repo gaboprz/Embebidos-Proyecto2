@@ -162,3 +162,8 @@ ssh root@192.168.100.9
 # Resultado
 ssh: connect to host 192.168.100.9 port 22: Connection refused
 ```
+
+
+## **Fecha: 24/04/2026**
+
+- Se sigue tratando de dejar funcionando la funcionalidad de acceso a la jetson a través de conexión ssh, pero esto no se logra. Se quedó en un punto en el que la dirección ip de la jetson estaba visible, pero ahora, luego de algunos ajustes en el archivo de configuraciones, se volvió a perder esta visibilidad.
