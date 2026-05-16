@@ -171,3 +171,553 @@ ssh: connect to host 192.168.100.9 port 22: Connection refused
 ## **Fecha: 26/04/2026**
 
 -  Se investiga y se elaboran las secciones de la 7 a la 10, de manera preliminar, del primer avance del proyecto. Estas se agregan en un documento latex, para luego exportarlo a pdf.
+
+
+## **Fecha: 14/05/2026, 15/05/2026 y 16/05/2026**
+
+Luego de que realicé el minitaller sobre Sistemas Embebidos de Inteligencia Artificial, usando una Raspberry Pi 5 y Ollama, tengo una base clara de algunas de las funcionalidades que debo agregar dentro de la primera iteración de la imagen generada en Yocto para la Jetson Nano.
+
+Se trabajo de manera intensiva para lograr que la Jetson Nano P3450 booeteara correctamente una imagen Yocto Dunfell personalizada con Ollama, autologin y SSH. El proceso requirió multiples iteraciones, diagnostico de errores y ajustes hasta lograr el arranque exitoso.
+
+---
+
+### Creación del Contenedor de Docker
+
+Se crea una carpeta y dentro de esta se agrega el Dockerfile que tiene este contenido:
+
+```bash
+# Imagen base: Ubuntu 22.04 LTS
+FROM ubuntu:22.04
+
+# Evita que apt lance preguntas interactivas durante la instalación
+# de paquetes.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instala todas las dependencias que Yocto necesita para compilar.
+RUN apt-get update && apt-get install -y \
+    gawk wget git diffstat unzip texinfo gcc build-essential chrpath \
+    socat cpio python3 python3-pip python3-pexpect xz-utils debianutils \
+    iputils-ping python3-git python3-jinja2 libegl-mesa0 libsdl1.2-dev \
+    pylint xterm python3-subunit mesa-common-dev zstd liblz4-tool \
+    python3-distutils curl locales sudo vim tmux file mc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Yocto requiere un locale UTF-8 configurado correctamente.
+# Configuran el idioma y la codificación de los caracteres
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# Yocto no puede correr como root por razones de seguridad.
+# Se crea un usuario normal llamado yoctouser con UID/GID 1000,
+# que coincide con el UID típico del usuario del host en Linux.
+ARG USERNAME=yoctouser
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd --gid $USER_GID $USERNAME \
+    # Crea el usuario con home en /home/yoctouser y shell bash
+    && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
+    # Permisos sudo sin contraseña: necesario para algunos pasos del build
+    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    # 0440: el archivo de sudoers debe ser solo lectura para funcionar
+    && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# Cambia al usuario sin privilegios para el resto del build.
+USER yoctouser
+
+# Directorio de trabajo del contenedor: donde vive el workspace de Yocto.
+WORKDIR /home/yoctouser/yocto-workspace
+```
+
+Luego de eso, sigo estos pasos para dejar funcional el contenedor:
+
+```bash
+# Construye la imagen Docker — solo instala paquetes del sistema
+docker build -t yocto-builder-jetson .
+
+# Crea la carpeta que se montará como volumen
+mkdir -p yocto-workspace
+
+# Monta un volumen — conecta una carpeta del host con una carpeta del contenedor.
+docker run -it --name yocto-ia-jetson \
+  -v $(pwd)/yocto-workspace:/home/yoctouser/yocto-workspace \
+  yocto-builder-jetson
+
+# Para volver a entrar en sesiones posteriores
+docker start yocto-ia-jetson
+docker exec -it yocto-ia-jetson /bin/bash
+```
+
+---
+
+### Creación del ambiente Yocto y las recetas
+
+Se reconstruyó el ambiente Yocto Dunfell desde cero dentro de un contenedor Docker. Se clonaron los repositorios necesarios:
+
+```bash
+# Clonar Poky rama Dunfell
+git clone -b dunfell https://git.yoctoproject.org/poky.git poky
+
+# Clonar meta-openembedded rama Dunfell
+git clone -b dunfell https://github.com/openembedded/meta-openembedded.git poky/meta-openembedded
+
+# Clonar meta-tegra rama Dunfell
+git clone -b dunfell https://github.com/OE4T/meta-tegra.git poky/meta-tegra
+```
+
+Se inicializo el entorno de build y se registraron las capas:
+
+```bash
+cd poky
+source oe-init-build-env build
+
+bitbake-layers add-layer ../meta-openembedded/meta-oe
+bitbake-layers add-layer ../meta-openembedded/meta-python
+bitbake-layers add-layer ../meta-openembedded/meta-networking
+bitbake-layers add-layer ../meta-tegra
+
+# Se crea y registra la capa personalizada
+bitbake-layers create-layer meta-ai
+bitbake-layers add-layer meta-ai/
+```
+
+Se creo la capa personalizada `meta-ai` con las recetas de autologin, show-ip y ollama.
+
+Se configuró `local.conf` con los parámetros necesarios para la Jetson:
+
+```bash
+# ================================================================
+#  local.conf — Yocto Dunfell | Jetson Nano P3450
+# ================================================================
+
+# Jetson Nano Developer Kit (P3450)
+MACHINE = "jetson-nano-devkit"
+DISTRO = "poky"
+PACKAGE_CLASSES = "package_ipk"
+
+# ── systemd ──────────────────────────────────────────────────────
+DISTRO_FEATURES_append = " systemd"
+VIRTUAL-RUNTIME_init_manager = "systemd"
+DISTRO_FEATURES_BACKFILL_CONSIDERED = "sysvinit"
+VIRTUAL-RUNTIME_initscripts = ""
+
+# ── Zona horaria ──────────────────────────────────────────────────
+DEFAULT_TIMEZONE = "America/Costa_Rica"
+
+# ── Hardware ──────────────────────────────────────────────────────
+ENABLE_UART = "1"
+
+# ── Image features ────────────────────────────────────────────────
+EXTRA_IMAGE_FEATURES += " \
+    empty-root-password \
+    ssh-server-openssh \
+    allow-empty-password \
+"
+
+# ── Paquetes de red ───────────────────────────────────────────────
+IMAGE_INSTALL_append = " \
+    dhcpcd \
+    iproute2 \
+    iputils \
+    net-tools \
+"
+
+# ── Zona horaria y utilidades ─────────────────────────────────────
+IMAGE_INSTALL_append = " tzdata"
+IMAGE_INSTALL_append = " bash vim htop procps coreutils"
+
+# ── Ollama y dependencias ─────────────────────────────────────────
+IMAGE_INSTALL_append = " ollama ca-certificates libstdc++ libgcc libgomp"
+
+# ── Imagen de salida ──────────────────────────────────────────────
+# tegraflash genera el paquete completo para flashear con las
+# herramientas de NVIDIA. Incluye el filesystem + bootloader config.
+IMAGE_FSTYPES = "ext4"
+IMAGE_ROOTFS_EXTRA_SPACE = "8388608"
+
+IMAGE_CLASSES_append = " image_types_tegra"
+
+IMAGE_FSTYPES_pn-core-image-base = " tegraflash tar.gz"
+
+WKS_FILE_pn-core-image-base = ""
+
+# ── Licencias ─────────────────────────────────────────────────────
+# En Dunfell: LICENSE_FLAGS_WHITELIST no LICENSE_FLAGS_ACCEPTED
+# "nv-tegra" acepta la EULA de NVIDIA necesaria para los paquetes
+# propietarios del BSP de la Jetson (bootloader, cuda libs, etc.)
+LICENSE_FLAGS_WHITELIST = "commercial nv-tegra"
+
+# Acepta explícitamente la EULA de NVIDIA para la Jetson Nano
+ACCEPT_EULA_jetson-nano-devkit = "1"
+
+# ── Rendimiento de compilación ────────────────────────────────────
+BB_NUMBER_PARSE_THREADS = "2"
+BB_NUMBER_THREADS = "4"
+PARALLEL_MAKE = "-j 4"
+
+# ── Directorios de caché ──────────────────────────────────────────
+DL_DIR ?= "${TOPDIR}/../downloads"
+SSTATE_DIR ?= "${TOPDIR}/../sstate-cache"
+TMPDIR = "${TOPDIR}/tmp"
+
+# En Dunfell CONF_VERSION es "1" no "2"
+CONF_VERSION = "1"
+```
+
+Se preparó el binario de Ollama para ARM64. Se detectó que el formato `.tar.zst` de Ollama v0.22.1 no es soportado por Yocto Dunfell — el parser de BitBake copiaba el archivo sin extraerlo. Se resolvió convirtiendo el binario a `.tar.gz` en el host:
+
+```bash
+# Descargar Ollama v0.22.1 para ARM64 (formato .tar.zst)
+wget https://github.com/ollama/ollama/releases/download/v0.22.1/ollama-linux-arm64.tar.zst
+
+# En el host
+mkdir /tmp/ollama-extract
+tar --use-compress-program=unzstd -xf ollama-linux-arm64.tar.zst -C /tmp/ollama-extract/
+tar -czvf ollama-linux-arm64.tar.gz -C /tmp/ollama-extract .
+```
+
+Se descargó el modelo gemma2:2b, se emapaquetó y se copiaron ambos archivos a la receta.
+
+**Nota:** Inicialmente se estaba usando `gemma3:4b`, pero al tratar de correr una inferencia en la Jetson, esta indicó que no podía, dado que no tenía suficiente memoria disponible. Ocupaba 4GB y solo tenía 3.5GB.
+
+```bash
+ollama pull gemma2:2b
+sudo tar -czvf gemma2-2b-prebaked.tar.gz -C /usr/share/ollama/.ollama models
+```
+
+Hay que copiar y pegar manualmente los archivos dentro de la receta de ollama.
+
+Se corrió el build dentro del contenedor:
+
+```bash
+bitbake core-image-base
+```
+
+El build se completo exitosamente y se generó el archivo:
+
+```
+poky/build/tmp/deploy/images/jetson-nano-devkit/core-image-base-jetson-nano-devkit.tegraflash.tar.gz
+```
+
+---
+
+### Extracción y preparación de la imagen en el host
+
+Como el workspace estaba montado como volumen, el archivo era accesible directamente desde el host. Se copió a una carpeta limpia en el Escritorio:
+
+```bash
+# Primera hay que copiar y pegar manualmente el build resultante al Escritorio
+
+# Se crea carpeta para extraer la imagen
+mkdir ~/Escritorio/jetson-flash-limpio
+
+# Se toma el archivo del build y se descomprime dentro de la carpeta recién creada
+tar -xzf core-image-base-jetson-nano-devkit.tegraflash.tar.gz -C jetson-flash-limpio/
+
+cd jetson-flash-limpio
+```
+
+Se verificó la integridad del filesystem antes de continuar:
+
+```bash
+sudo e2fsck -n core-image-base.ext4
+# DEBE decir clean antes de continuar
+```
+
+En la primera iteración esto falló con "Superbloque tiene archivo de transacciones inválido", indicando que el ext4 estaba corrupto desde el contenedor por modificaciones de intentos anteriores. Se recompiló la imagen en el contenedor con `bitbake -c cleansstate core-image-base && bitbake core-image-base` y se repitió la extracción. En la segunda iteración `e2fsck` reportó: `clean`.
+
+Se corrigió el tamaño del ext4 para que fuera múltiplo de 1MB, requisito de las herramientas de flasheo de NVIDIA:
+
+```bash
+SIZE=$(stat -c%s core-image-base.ext4)
+REMAINDER=$((SIZE % 1048576))
+if [ $REMAINDER -ne 0 ]; then
+    PADDING=$((1048576 - REMAINDER))
+    dd if=/dev/zero bs=1 count=$PADDING >> core-image-base.ext4
+fi
+# Verificar que el residuo es 0
+echo "Residuo: $(($(stat -c%s core-image-base.ext4) % 1048576))"
+```
+
+---
+
+### Flasheo del bootloader en la QSPI — Recovery Mode
+
+El bootloader que trae la Jetson de fábrica en su memoria QSPI interna no es compatible con el layout de particiones que genera meta-tegra. Es necesario actualizarlo al menos una vez usando Recovery Mode.
+
+Se puso la Jetson en Recovery Mode:
+
+1. Con la Jetson apagada y desconectada, se cortocircuitaron los pines **FC REC** y **GND** del header J40 con un cable jumper hembra-hembra. En la revision A02, estos son los pines 3 y 4 contando desde la esquina más cercana al conector de cámara MIPI CSI.
+2. Se conectó el cable Micro-USB entre la Jetson y la laptop. La Jetson enciende automáticamente al conectar el cable. En este caso, esta cable cumple la función de alimentación y permite la comunicación entre el host y le Jetson.
+3. Se verificó que la Jetson estaba en Recovery Mode:
+
+```bash
+lsusb | grep -i nvidia
+# Resultado: Bus 001 Device 004: ID 0955:7f21 NVIDIA Corp. APX
+```
+
+Se intentó flashear con `doflash.sh` completo, pero fallaba siempre al intentar transferir la particion APP (el rootfs de 3.5GB) a través de USB — el protocolo de Recovery Mode no es estable para transferencias tan grandes. El error aparecía a distintos porcentajes (7%, 16%) con "Error: Return value 1".
+
+Se identificó que todas las particiones del bootloader anteriores a APP si se escribían correctamente al 100% en cada intento (NVC, TBC, EBT, DTB, LNX, etc). La solución fue usar el flag `--spi-only` para flashear únicamente la QSPI sin intentar transferir el rootfs:
+
+```bash
+# Dentro del directorio del tegraflash extraído
+sudo ./doflash.sh --spi-only
+```
+
+Este comando se completó en 2-3 minutos sin errores. Con esto el bootloader de la QSPI quedó actualizado y compatible con la imagen Yocto.
+
+Se quitó el jumper de los pines FC REC y GND.
+
+---
+
+### Generación de la imagen de SD y diagnóstico de corrupción
+
+Se generó la imagen completa de SD con `dosdcard.sh`, que crea un archivo con todas las particiones necesarias (GPT, bootloader secundario, kernel y rootfs):
+
+```bash
+sudo ./dosdcard.sh jetson-nano-sdcard.img
+# Responder: yes
+# Al terminar debe decir: [OK: jetson-nano-sdcard.img]
+```
+
+El archivo generado pesa ~15GB porque `dosdcard.sh` tiene hardcodeado `-s 16G` para el tamano de la particion APP.
+
+Se verificó que el archivo era un sparse image válido:
+
+```bash
+file jetson-nano-sdcard.img
+# Resultado: DOS/MBR boot sector — imagen de disco real, flasheable directamente
+```
+
+Se verificó la integridad del filesystem dentro de la imagen:
+
+```bash
+sudo losetup -P /dev/loop99 jetson-nano-sdcard.img
+sudo e2fsck -n /dev/loop99p1
+sudo losetup -d /dev/loop99
+# Resultado: clean
+```
+
+---
+
+### Flasheo de la SD y primer arranque
+
+Se identificó la SD card en el host (el único disco con RM=1 en `lsblk`):
+
+```bash
+lsblk -d | grep -v loop
+# sdb  8:16  1  58.1G  0  disk  <- RM=1, es la SD
+```
+
+Se limpió la SD para eliminar particiones anteriores:
+
+```bash
+sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100 status=progress
+```
+
+Se flasheó la imagen completa:
+
+```bash
+sudo dd if=jetson-nano-sdcard.img of=/dev/sdb bs=4M status=progress conv=fsync
+sync
+```
+
+Se verifico que la SD montó correctamente antes de insertarla en la Jetson:
+
+```bash
+sudo mount /dev/sdb1 /mnt/jetson-sd
+ls /mnt/jetson-sd
+# Resultado: bin  boot  dev  etc  home  lib  lost+found  media  mnt  proc  root  run  sbin  sys  tmp  usr  var
+sudo umount /mnt/jetson-sd
+```
+
+Se insertó la SD en la Jetson, se confirmó que el jumper estaba quitado, se conectó el HDMI y la alimentación por Micro-USB. La Jetson mostró el logo de NVIDIA y arrancó exitosamente la imagen Yocto.
+
+Se confirmó la funcionalidad de ollama, además de que se puedo conectar a través de ssh con una computadora dentro de la misma red local de internet.
+
+---
+
+### Errores / Problemas
+
+**Error 1: git clone de meta-tegra con rama incorrecta**
+
+Al intentar clonar con `-b dunfell-l4t-r32.7.x`, el repositorio devolvió "fatal: Remote branch not found". La rama correcta es simplemente `dunfell`.
+
+```bash
+# Incorrecto
+git clone -b dunfell-l4t-r32.7.x https://github.com/OE4T/meta-tegra.git poky/meta-tegra
+# Correcto
+git clone -b dunfell https://github.com/OE4T/meta-tegra.git poky/meta-tegra
+```
+
+---
+
+**Error 2: Ollama tar.zst no se extrae en Dunfell**
+
+Síntoma: `do_install` fallaba con `cannot stat ollama-release/bin/ollama`. BitBake copiaba el `.tar.zst` sin extraerlo porque Yocto Dunfell (3.1) no tiene soporte nativo para compresion zstd.
+
+Solución: convertir el binario a `.tar.gz` en el host antes de copiarlo a la receta:
+
+```bash
+mkdir /tmp/ollama-extract
+tar --use-compress-program=unzstd -xf ollama-linux-arm64.tar.zst -C /tmp/ollama-extract/
+tar -czvf ollama-linux-arm64.tar.gz -C /tmp/ollama-extract .
+```
+
+---
+
+**Error 3: size of core-image-base.ext4 is not multiple of 1048576**
+
+Las herramientas de NVIDIA requieren que el archivo ext4 tenga un tamaño exactamente múltiplo de 1MB. Se resolvió agregando bytes de padding:
+
+```bash
+SIZE=$(stat -c%s core-image-base.ext4)
+REMAINDER=$((SIZE % 1048576))
+PADDING=$((1048576 - REMAINDER))
+dd if=/dev/zero bs=1 count=$PADDING >> core-image-base.ext4
+```
+
+---
+
+**Error 4: doflash.sh falla al escribir la partición APP**
+
+Síntoma: el flasheo completo por USB completaba todas las particiones del bootloader pero fallaba siempre en APP con "Error: Return value 1" a distintos porcentajes (7%, 16%).
+
+Causa: la transferencia de 3.5GB por USB a través del protocolo de Recovery Mode es inestable.
+
+Solucion: separar el proceso. Usar `--spi-only` para flashear solo la QSPI, y luego escribir el rootfs directamente en la SD desde el host con `dosdcard.sh`:
+
+```bash
+# Paso 1: solo la QSPI por USB. La Jetson está en Recovery Mode y conectada al host
+sudo ./doflash.sh --spi-only
+
+# Paso 2: el rootfs directamente en la SD desde el host. Únicamente la SD está conectada al host
+sudo ./dosdcard.sh jetson-nano-sdcard.img
+sudo dd if=jetson-nano-sdcard.img of=/dev/sdb bs=4M status=progress conv=fsync
+```
+
+---
+
+**Error 5: ext4 corrupto en intentos anteriores**
+
+Síntoma: `sudo mount /dev/sdb1` fallaba con "probably corrupted filesystem". `e2fsck` mostraba "Superbloque tiene archivo de transacciones invalido".
+
+Causa: la SD fue sobreescrita múltiples veces con metodos distintos, dejando mezcla de datos incompatibles. Además, el ext4 fuente también estaba corrupto por modificaciones durante los intentos de flasheo.
+
+Solución: limpiar la SD completamente, recompilar la imagen en el contenedor para obtener un ext4 limpio, y verificar con `e2fsck` antes de proceder:
+
+```bash
+# Limpiar la SD
+sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100 status=progress
+
+# En el contenedor, regenerar la imagen
+bitbake -c cleansstate core-image-base
+bitbake core-image-base
+
+# Verificar el ext4 antes de usarlo
+sudo e2fsck -n core-image-base.ext4
+# Debe decir: clean
+```
+
+---
+
+**Error 6: tabla GPT desactualizada**
+
+Síntoma: `sudo fdisk -l /dev/sdb` mostraba "GPT PMBR size mismatch (30937499 != 121802751)". La imagen de 16GB fue flasheada en una SD de 64GB y la tabla GPT quedaba desactualizada.
+
+Solucion: correr `sudo parted /dev/sdb print` y responder `Fix` cuando pregunta si corregir el tamano.
+
+---
+
+### Paso a paso replicable para futuras imágenes
+
+Una vez que el bootloader de la QSPI ya fue flasheado con `--spi-only`, para las próximas imágenes solo hay que repetir los pasos de la SD.
+
+**Parte 1 — Preparar la imagen en el host**
+
+```bash
+# Crear carpeta limpia y extraer
+mkdir ~/Escritorio/jetson-flash-limpio
+tar -xzf core-image-base-jetson-nano-devkit.tegraflash.tar.gz -C ~/Escritorio/jetson-flash-limpio/
+cd ~/Escritorio/jetson-flash-limpio
+
+# Verificar integridad del ext4
+sudo e2fsck -n core-image-base.ext4
+# Debe decir: clean
+
+# Corregir tamano del ext4 (multiplo de 1MB)
+SIZE=$(stat -c%s core-image-base.ext4)
+REMAINDER=$((SIZE % 1048576))
+if [ $REMAINDER -ne 0 ]; then
+    PADDING=$((1048576 - REMAINDER))
+    dd if=/dev/zero bs=1 count=$PADDING >> core-image-base.ext4
+fi
+echo "Residuo: $(($(stat -c%s core-image-base.ext4) % 1048576)) -- debe ser 0"
+```
+
+**Parte 2 — Flashear el bootloader en la QSPI (solo la primera vez)**
+
+```bash
+# 1. Cortocircuitar pines FC REC y GND del header J40 (pines 3 y 4, revision A02)
+# 2. Conectar Micro-USB entre Jetson y laptop
+
+# Verificar Recovery Mode
+lsusb | grep -i nvidia
+# Debe mostrar: ID 0955:7f21 NVIDIA Corp. APX
+
+# Flashear solo la QSPI
+sudo ./doflash.sh --spi-only
+
+# Quitar el jumper al terminar
+```
+
+**Parte 3 — Generar y flashear la SD**
+
+```bash
+# Generar imagen completa de SD
+sudo ./dosdcard.sh jetson-nano-sdcard.img
+# Responder: yes
+
+# Verificar integridad de la imagen
+sudo losetup -P /dev/loop99 jetson-nano-sdcard.img
+sudo e2fsck -n /dev/loop99p1
+sudo losetup -d /dev/loop99
+# Debe decir: clean
+
+# Identificar la SD (RM=1 en lsblk)
+lsblk -d | grep -v loop
+
+# Limpiar la SD. En el "of" se indica qué disco se va a limpiar
+sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100 status=progress
+
+# Flashear
+sudo dd if=jetson-nano-sdcard.img of=/dev/sdb bs=4M status=progress conv=fsync
+sync
+
+# Verificar que monta correctamente
+sudo mount /dev/sdb1 /mnt/jetson-sd
+ls /mnt/jetson-sd
+sudo umount /mnt/jetson-sd
+# Debe mostrar la estructura del filesystem: bin, boot, etc, home, usr, var
+```
+
+**Parte 4 — Arrancar la Jetson**
+
+```bash
+# 1. Insertar la SD en el slot microSD de la Jetson
+# 2. Confirmar que NO hay jumper en pines FC REC y GND
+# 3. Conectar monitor por HDMI
+# 4. Conectar alimentacion por Micro-USB
+# 5. Esperar 1-2 minutos
+
+# En el monitor deberia aparecer:
+# - Logo de NVIDIA
+# - Mensajes de boot de Linux
+# - Banner show-ip con la IP de eth0
+# - Prompt de autologin de root
+
+# Conectarse por SSH desde la laptop
+ssh root@<IP_DE_LA_JETSON>
+```
