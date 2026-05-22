@@ -689,12 +689,25 @@ sudo losetup -d /dev/loop99
 # Identificar la SD (RM=1 en lsblk)
 lsblk -d | grep -v loop
 
-# Limpiar la SD. En el "of" se indica qué disco se va a limpiar
+# Limpiar la SD. En el "of" se indica qué disco se va a limpiar. Limpieza parcial
 sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100 status=progress
+# Limpieza total de la SD
+sudo dd if=/dev/zero of=/dev/sdb bs=4M status=progress
+sync
 
 # Flashear
 sudo dd if=jetson-nano-sdcard.img of=/dev/sdb bs=4M status=progress conv=fsync
 sync
+
+# Comparar la imagen con lo que quedó en la SD
+# Ambos hashes DEBEN ser idénticos
+sudo dd if=/dev/sdb bs=4M count=3776 2>/dev/null | md5sum
+dd if=jetson-nano-sdcard.img bs=4M count=3776 2>/dev/null | md5sum
+
+# Este paso previene los errores de inode que aparecieron
+# Siempre correrlo después de flashear
+sudo umount /dev/sdb1 2>/dev/null
+sudo e2fsck -y /dev/sdb1
 
 # Verificar que monta correctamente
 sudo mount /dev/sdb1 /mnt/jetson-sd
@@ -721,3 +734,176 @@ sudo umount /mnt/jetson-sd
 # Conectarse por SSH desde la laptop
 ssh root@<IP_DE_LA_JETSON>
 ```
+
+
+## **Fecha: 17/05/2026 — 18/05/2026**
+
+Luego de tener la Jetson Nano funcionando con la imagen Yocto base, se decide intentar agregar soporte de WiFi para que esta se conecte automáticamente al hotspot del celular, eliminando la dependencia del cable Ethernet. Para esto se adquirió el adaptador **D-Link AN3U** (USB ID `2001:3328`, fabricante Realtek), que en teoría debía ser compatible con el kernel 4.9 de NVIDIA.
+
+---
+
+### Investigación de compatibilidad del adaptador
+
+Antes de comprar, se investigaron los adaptadores disponibles en ExtremeTech CR. La mayoría usaban chipsets WiFi 6 modernos (RTL8832AU, RTL8821CU, RTL8812BU) cuyos drivers no existen en el kernel 4.9. El D-Link AN3U fue seleccionado porque usaba tecnología WiFi 4 y se identificó que su chipset era Realtek, lo que prometía mayor compatibilidad con kernels antiguos.
+
+Una vez adquirido, se confirmó el USB ID exacto conectándolo a la laptop:
+
+```bash
+lsusb -v -d 2001: 2>/dev/null | grep -E "idVendor|idProduct|iManufacturer"
+# Resultado:
+# idVendor  0x2001 D-Link Corp.
+# idProduct 0x3328
+# iManufacturer Realtek
+```
+
+---
+
+### Intento de soporte en la imagen Yocto
+
+Se creó la receta `rtl8192eu_1.0.bb` dentro de la capa `meta-ai`, la cual compilaría el driver out-of-tree desde el repositorio `Mange/rtl8192eu-linux-driver` (rama `realtek-4.4.x`). Esta era la única opción viable porque el USB ID `2001:3328` no está en las tablas de ninguno de los tres drivers que sí vienen en el kernel 4.9 (`rtl8xxxu`, `rtl8192cu`, `r8188eu`), lo cual se verificó cargando cada uno manualmente en la Jetson sin obtener ninguna interfaz `wlan0`.
+
+Se agregaron también los paquetes `wpa-supplicant` y `linux-firmware` al `local.conf`, junto con la configuración del hotspot del iPhone dentro del `core-image-base.bbappend`.
+
+---
+
+### Por qué no funcionó
+
+El driver compiló correctamente todos los archivos objeto (~120 archivos `.o`), pero falló siempre en la etapa de enlazado final. El problema es estructural: Yocto Dunfell inyecta en el ambiente de compilación la variable `LDFLAGS` con el valor `-Wl,-O1 -Wl,--hash-style=gnu`, que es sintaxis de GCC para pasarle opciones al linker a través del compilador. Sin embargo, el sistema de compilación del kernel (kbuild) llama al linker `ld` directamente sin pasar por GCC, y `ld` no entiende la sintaxis `-Wl,`. Se intentaron múltiples estrategias para vaciar `LDFLAGS` antes de la compilación, incluyendo `LDFLAGS[unexport]`, `unset LDFLAGS` y `LDFLAGS=` como argumento de make, pero el flag seguía propagándose a través del sub-make del kernel.
+
+---
+
+### Método alternativo
+
+Se logra conectar la computadora host a la red hotspot del celular, luego se conecta la Jetson con la computadora host a través de un cable ethernet, con lo cual la Jetson adquiere conectividad internet. Este método permite conectarse, aunque sea de manera indirecta a la red celular, evitando la necesidad de conectarse a redes algo complejas, como la de la Escuela de Electrónica.
+
+### Errores / Problemas
+
+**Error 1: USB ID 2001:3328 no reconocido por ningún driver nativo del kernel 4.9**
+
+Al conectar el adaptador a la Jetson con la imagen Yocto, el sistema detectaba el dispositivo USB correctamente pero ningún driver lo reclamaba. Se probaron los tres drivers disponibles de Realtek sin éxito:
+
+```bash
+modprobe rtl8xxxu   # Se registra pero no crea wlan0
+modprobe rtl8192cu  # Se registra pero no crea wlan0
+modprobe r8188eu    # Se registra pero no crea wlan0
+ip link show        # wlan0 nunca aparece
+```
+
+La causa es que el USB ID `2001:3328` fue agregado a la tabla de dispositivos de `rtl8xxxu` en versiones posteriores del kernel mainline, y NVIDIA no lo incluyó en su fork 4.9.
+
+---
+
+**Error 2: LDFLAGS de Yocto incompatibles con kbuild del kernel 4.9**
+
+Síntoma: la compilación del driver completaba exitosamente los ~120 archivos `.o` pero fallaba en el enlazado final con:
+
+```bash
+aarch64-poky-linux-ld: unrecognized option '-Wl,-O1'
+make[3]: *** [scripts/Makefile.build:637: 8192eu.o] Error 1
+```
+
+Causa: Yocto Dunfell exporta `LDFLAGS="-Wl,-O1 -Wl,--hash-style=gnu"` al ambiente. kbuild usa `$(LD) $(LDFLAGS)` directamente, y `ld` no entiende sintaxis de GCC. Múltiples estrategias de limpieza no lograron evitar que el flag llegara al sub-make del kernel.
+
+---
+
+**Error 3: Checksums de inodes inválidos en la SD tras varias sobreescrituras**
+
+Durante las iteraciones de flasheo de la imagen, se detectó que la SD presentaba errores de checksum en inodes al montarla:
+
+```bash
+EXT4-fs error (device sdb1): ext4_lookup:1787: inode #669: iget: checksum invalid
+Aborting journal on device sdb1-8.
+```
+
+La causa fue limpiar la SD solo parcialmente (`count=100`, es decir 100 MB) antes de cada flasheo, dejando datos residuales de imágenes anteriores que interferían con la escritura nueva. La solución fue realizar una limpieza completa del disco antes de cada flasheo, y correr `e2fsck -y` sobre la partición después de escribir la imagen para reparar los checksums:
+
+```bash
+# Limpieza completa de la SD (tarda ~50 minutos)
+sudo dd if=/dev/zero of=/dev/sdb bs=4M status=progress
+sync
+
+# Reparar checksums del filesystem después de flashear
+sudo umount -l /dev/sdb1
+sudo e2fsck -y /dev/sdb1
+```
+
+## **Fecha: 19/05/2026 — 21/05/2026**
+
+Luego del intento fallido de compilación del driver por el problema con `LDFLAGS`, se realizó un segundo intento de agregar soporte WiFi a la imagen Yocto, esta vez restructurando completamente la receta para usar la clase `module` de Yocto, que maneja correctamente el entorno de compilación cruzada de módulos del kernel. El objetivo seguía siendo conectar la Jetson Nano al hotspot del celular usando el adaptador D-Link AN3U.
+
+---
+
+### Segunda iteración de la receta del driver
+
+Se creó `rtl8192eu_git.bb` desde cero usando `inherit module`, que reemplaza el `Makefile` manual y gestiona el entorno de compilación cruzada automáticamente. Se configuró `EXTRA_OEMAKE` para pasar las rutas del árbol del kernel sin incluir `CC`, `LD` ni `AR`, ya que pasarlos con los flags embebidos de Yocto causaba una recursión en la variable `ccflags-y` dentro del sistema de compilación del kernel. Adicionalmente, se creó `linux-tegra_%.bbappend` con un fragmento `.cfg` para habilitar `CONFIG_CFG80211` y `CONFIG_RFKILL` como módulos en el kernel.
+
+La compilación de la receta pasó por tres errores consecutivos antes de completarse con éxito:
+
+**Error de licencia:** `LIC_FILES_CHKSUM` apuntaba a `GPL-2.0-only`, que en Dunfell no existe. El archivo correcto es `GPL-2.0` con md5 `801f80980d171dd6425610833a22dbe6`.
+
+**Error de MODPOST:** Al llegar a la etapa de enlazado del módulo, el build fallaba con:
+```
+scripts/Makefile.lib:3: *** Recursive variable 'ccflags-y' references itself. Stop.
+```
+La causa fue que la línea 1 del `Makefile` del driver (`ccflags-y += $(USER_EXTRA_CFLAGS)`) crea una variable recursiva en GNU make. Al ejecutar MODPOST, el kernel evalúa `ccflags-y` desde `Makefile.lib` y encuentra una cadena circular. Se resolvió agregando un `do_configure` que cambia `+=` por `:=` en esa línea con `sed`, convirtiendo la variable a expansión inmediata.
+
+**Error de empaquetado:** El `do_install` creaba `/lib/firmware/` vacío porque el repo del driver no incluye `.bin` en su raíz. El directorio quedaba sin archivos y Yocto lo rechazaba al empaquetar. Se eliminó esa sección del `do_install`, dado que el firmware ya lo provee `linux-firmware`.
+
+Con estos tres fixes aplicados, `bitbake rtl8192eu` completó exitosamente.
+
+---
+
+### Configuración de red en la imagen
+
+En paralelo al driver, se configuró `core-image-base.bbappend` para habilitar la autenticación WiFi y la obtención de IP. Se agregó:
+
+- Un archivo `wpa_supplicant-wlan0.conf` con las credenciales del hotspot, instalado con permisos `600`.
+- Un symlink de systemd para `wpa_supplicant@wlan0.service`, usando el template de la interfaz.
+- Una regla udev `99-dlink-an3u.rules` para cargar `8192eu` al detectar el USB ID `2001:3328`.
+- Un archivo `/etc/systemd/network/25-wlan0.network` para que `systemd-networkd` gestionara DHCP en `wlan0` automáticamente.
+
+Se detectó que las rutas de los `.service` de systemd en Dunfell sin `usrmerge` están en `/lib/systemd/system/` y no en `/usr/lib/systemd/system/`, lo que causaba que los tres servicios de red (wpa_supplicant, timesyncd y dhcpcd) reportaran "no encontrado" en el postprocess del rootfs. Se corrigieron todas las rutas. Se descubrió también que `dhcpcd` no instala un `.service` de systemd en meta-networking, por lo que se migró a `systemd-networkd` que ya venía habilitado en la imagen base.
+
+---
+
+### Pruebas en la Jetson y diagnóstico del fallo de runtime
+
+Con la imagen flasheada, el diagnóstico inicial fue prometedor: el módulo cargaba (`lsmod` mostraba `8192eu`), el dispositivo USB era detectado correctamente (`lsusb` confirmaba `ID 2001:3328`), y la interfaz `1-2.3:1.0` existía en el sysfs del kernel. Sin embargo, `wlan0` nunca apareció y `wpa_supplicant@wlan0` no podía arrancar.
+
+Se ejecutaron múltiples intentos de diagnóstico:
+
+```bash
+# El driver carga pero nunca hace probe() del dispositivo
+ls -la /sys/bus/usb/drivers/rtl8192eu/   # Sin symlinks al dispositivo
+
+# El USB ID no está en la tabla compilada del módulo
+modinfo 8192eu | grep alias | grep "3328"  # Sin resultados
+
+# El bind manual falla
+echo "1-2.3:1.0" > /sys/bus/usb/drivers/rtl8192eu/bind  # Permission denied
+
+# El debug logging del driver no produce ningún output
+rmmod 8192eu && modprobe 8192eu rtw_drv_log_level=4
+echo "2001 3328" > /sys/bus/usb/drivers/rtl8192eu/new_id
+dmesg | tail -30   # Solo muestra el USB reset, nada del driver
+```
+
+La ausencia total de mensajes del driver incluso con `rtw_drv_log_level=4` indicó que `probe()` fallaba antes de que el sistema de logging propio del driver se inicializara. Se identificaron dos causas probables pero no se pudo confirmar cuál era la determinante:
+
+1. **USB ID ausente en la tabla compilada:** `modinfo` confirmó que `2001:3328` no estaba en las entradas `alias` del módulo. El script de Python en `do_configure` que debía insertarlo probablemente no funcionó por un problema de expansión de variables en el contexto del heredoc. Sin el ID compilado, el driver depende de `new_id` para hacer probe, un mecanismo frágil que no persiste entre reinicios.
+
+2. **Plataforma de compilación incorrecta:** El `Makefile` del repositorio Mange tiene `CONFIG_PLATFORM_I386_PC = y` por defecto. Con este flag activo, el driver compila rutas de código específicas de x86 para la inicialización USB y el manejo de energía del chip. En ARM64 estas rutinas fallan silenciosamente durante `probe()`.
+
+Se intentó corregir ambos problemas en una imagen adicional pero el comportamiento no cambió, en parte porque no fue posible verificar antes del flasheo que los cambios de `do_configure` se habían aplicado correctamente sobre el fuente.
+
+---
+
+### Decisión final
+
+Luego de múltiples iteraciones sin lograr que `wlan0` apareciera, se decidió abandonar el soporte WiFi con este adaptador. La conectividad de la Jetson Nano se mantiene a través de Ethernet, que funciona de manera estable desde iteraciones anteriores. De ser necesaria conectividad inalámbrica en el futuro, se consideraría un adaptador con driver completamente integrado en el kernel L4T 4.9, como los basados en el chipset **Ralink RT5370** (`rt2800usb`) que no requieren ninguna configuración adicional.
+
+### Errores / Problemas
+
+- **USB ID `2001:3328` no compilado en el módulo:** `modinfo 8192eu | grep alias` no retornó ninguna entrada para ese ID, confirmando que el driver nunca haría probe automático del adaptador sin intervención manual en cada arranque.
+- **`probe()` falla silenciosamente en ARM64:** El bind manual a `1-2.3:1.0` retornó "Permission denied" y el debug logging no produjo ningún mensaje, lo que indica un fallo muy temprano en la inicialización, posiblemente por la configuración de plataforma x86 compilada en el módulo.
+- **Script de Python en `do_configure` no ejecutado correctamente:** El script que debía insertar el USB ID en `os_dep/linux/usb_intf.c` usaba `python3 -c "..."` con `${S}` dentro de comillas simples anidadas en comillas dobles, impidiendo la expansión de la variable. El módulo compilado no incluía el ID a pesar de que el build no reportaba error.
