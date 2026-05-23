@@ -907,3 +907,330 @@ Luego de múltiples iteraciones sin lograr que `wlan0` apareciera, se decidió a
 - **USB ID `2001:3328` no compilado en el módulo:** `modinfo 8192eu | grep alias` no retornó ninguna entrada para ese ID, confirmando que el driver nunca haría probe automático del adaptador sin intervención manual en cada arranque.
 - **`probe()` falla silenciosamente en ARM64:** El bind manual a `1-2.3:1.0` retornó "Permission denied" y el debug logging no produjo ningún mensaje, lo que indica un fallo muy temprano en la inicialización, posiblemente por la configuración de plataforma x86 compilada en el módulo.
 - **Script de Python en `do_configure` no ejecutado correctamente:** El script que debía insertar el USB ID en `os_dep/linux/usb_intf.c` usaba `python3 -c "..."` con `${S}` dentro de comillas simples anidadas en comillas dobles, impidiendo la expansión de la variable. El módulo compilado no incluía el ID a pesar de que el build no reportaba error.
+
+
+## **Fecha: 21/05/2026 — 22/05/2026**
+
+El objetivo de esta etapa fue hacer que las inferencias del LLM (gemma2:2b corriendo a través de Ollama) utilizaran los núcleos GPU de la Jetson Nano en lugar del CPU. La motivación académica es demostrar aceleración por hardware en el contexto de IA en el borde (*edge AI*).
+
+---
+
+### Contexto de hardware
+
+La Jetson Nano P3450 tiene una arquitectura de cómputo unificado donde CPU y GPU comparten los mismos 4 GB de memoria LPDDR4 física. El GPU es un NVIDIA Maxwell con 128 núcleos CUDA, *Compute Capability* 5.3, y la versión de CUDA disponible en L4T 32.7.4 es la 10.2. Esto determina todas las decisiones técnicas que se tomaron, ya que el ecosistema de herramientas modernas de inferencia de LLM generalmente asume hardware mucho más nuevo.
+
+---
+
+### Diagnóstico inicial
+
+Al arrancar la Jetson con la imagen Yocto y correr una inferencia con `ollama run gemma2:2b`, tegrastats mostró que el campo `GR3D_FREQ` se mantenía en `0%` y `POM_5V_GPU` en `0/0`, mientras los cuatro cores de CPU operaban al 100%. El log de Ollama al arrancar reportó:
+
+```
+msg="inference compute" id=cpu library=cpu compute="" name=cpu
+```
+
+El campo `library=cpu` es definitivo: Ollama estaba usando exclusivamente el CPU. Al consultar `journalctl -u ollama` con `discovering available GPUs...` seguido de `inference compute id=cpu`, se confirmó que el servicio detectaba el hardware pero fallaba en usar el GPU.
+
+El driver de kernel `nvgpu` sí estaba cargado (`lsmod | grep nvgpu` lo confirmó) y los dispositivos `/dev/nvhost-ctrl`, `/dev/nvhost-gpu` existían en el sistema. El problema no era el driver del kernel sino la capa de usuario: las librerías CUDA y el binario de Ollama.
+
+---
+
+### Causa raíz #1 — El binario de Ollama no tenía soporte CUDA compilado
+
+El binario instalado en la imagen (`ollama-linux-arm64.tar.gz` descargado de los releases oficiales de Ollama) fue compilado para ARM64 genérico sin ningún backend de GPU. Las releases oficiales de Ollama para Linux ARM64 están pensadas para dispositivos como Raspberry Pi, donde no hay GPU CUDA. Este binario, al arrancar, solo registra un runner de CPU y reporta eso como el único dispositivo de inferencia disponible.
+
+Para que Ollama use GPU en Linux ARM64, el binario debe ser compilado desde fuente con soporte CUDA explícito, lo cual involucra compilar llama.cpp con CUDA y el binario Go con el build tag `-tags cuda`. Sin este proceso, ninguna cantidad de librerías CUDA instaladas en el sistema hace diferencia: el código que detecta e inicializa el GPU simplemente no está presente en el ejecutable.
+
+---
+
+### Causa raíz #2 — Incompatibilidad de versiones: CUDA 10.2 vs Ollama moderno
+
+Se intentó compilar Ollama desde fuente (`main` branch) en la propia Jetson. Después de resolver múltiples problemas de compilación cruzada (ver sección de errores), se logró generar el binario y se observó que al arrancar seguía reportando `library=cpu`.
+
+La investigación del código fuente reveló que la versión actual de Ollama solo construye runners de CUDA para versiones 12.x y 13.x, identificados como `cuda_v12` y `cuda_v13` en el código interno de discovery. No existe ningún runner `cuda_v10` en el árbol actual de Ollama. Al detectar CUDA 10.2 en el sistema, el código lo descarta silenciosamente y cae al fallback de CPU.
+
+Esto se confirmó con:
+
+```bash
+OLLAMA_DEBUG=1 go generate ./... 2>&1 | grep -iE "cuda|skip|version"
+# Retornó vacío — CUDA 10.2 fue ignorado sin mensaje
+```
+
+Y con la revisión del código de discovery:
+
+```bash
+grep -r "cuda_v" /tmp/ollama/discover/runner_test.go | head -5
+# cuda_v12, cuda_v13 — nunca cuda_v10
+```
+
+La conclusión es que la línea de soporte de CUDA en Ollama moderno comienza en CUDA 11.x o 12.x. El Jetson Nano P3450 con L4T 32.7.4 tiene CUDA 10.2 como versión final y no puede actualizarse sin cambiar el hardware.
+
+---
+
+### Causa raíz #3 — Incompatibilidades en el entorno de compilación de Yocto Dunfell
+
+Se intentó resolver el problema con una receta de Yocto que compilara Ollama con CUDA desde fuente. Este enfoque fue bloqueado por tres limitaciones estructurales del entorno:
+
+**go-native 1.14.15**: La versión de Go disponible en meta-oe de Yocto Dunfell es la 1.14.15. Cualquier versión de Ollama que pudiera compilarse con soporte para CUDA 10.2 (versiones de 2023-2024) requiere como mínimo Go 1.20, con la mayoría de commits verificados exigiendo Go 1.22.x. Esta brecha hace imposible usar go-native de Dunfell para compilar Ollama.
+
+**cmake-native 3.16.5**: llama.cpp, el backend de inferencia de Ollama, tiene en su CMakeLists.txt del módulo CUDA la directiva `cmake_minimum_required(VERSION 3.18)`, ya que usa `FindCUDAToolkit.cmake`, un módulo introducido en CMake 3.17. La versión de cmake-native en Dunfell es 3.16.5, que no incluye este módulo y por lo tanto falla en la detección del toolkit de CUDA.
+
+**GCC 9.5 con CUDA 10.2**: El compilador de CUDA (nvcc) incluido en L4T 32.7.4 para la Jetson Nano tiene una verificación interna que rechaza compiladores host con versión mayor a GCC 8. La imagen Yocto Dunfell usa GCC 9.5. Aunque en la práctica nvcc puede compilar con GCC 9 si se pasa el flag `--allow-unsupported-compiler`, esto añade una capa de incertidumbre al proceso.
+
+---
+
+### Análisis del repositorio del profesor
+
+El repositorio del profesor (`yocto-jetson-ollama`) provee una receta de Ollama con dos diferencias conceptuales importantes respecto a lo que se había intentado:
+
+1. **Build tag `-tags cuda` en Go**: En versiones antiguas de Ollama (pre-0.4.0, antes de octubre 2024), el soporte CUDA en el binario Go estaba condicionado por un build tag. Los archivos con `//go:build cuda` no se compilaban sin ese flag. Esto explica por qué nuestro intento de compilar desde fuente seguía produciendo un binario CPU-only: nunca se usó el tag correcto.
+
+2. **SRCREV específico apuntando a la estructura antigua**: El enfoque del profesor apuntaba a un commit donde `llm/llama.cpp` era un subdirectorio con llama.cpp como subproyecto CMake directo, estructura que desapareció en Ollama 0.4.0.
+
+Sin embargo, el análisis reveló problemas fundamentales en la receta del profesor:
+
+- **El SRCREV `bbc95e9f26284cc8ca2b9ab8a0a9dd5f63de8e46` no existe** en `github.com/ollama/ollama`. El git fetch con ese hash retornó `fatal: remote error: upload-pack: not our ref`. El commit es inválido para el repositorio referenciado.
+
+- **Los commits reales con la estructura `llm/llama.cpp`** (los tres últimos que tocaron ese path: `c6509bf`, `b754f5a`, `8de8729`) se verificaron y todos requieren Go 1.22.x, seguiendo siendo incompatibles con go-native 1.14.15 de Dunfell.
+
+- **El entorno del profesor es probablemente Kirkstone**, no Dunfell. Su `local.conf` menciona `tegrademo` como distro y su README indica `meta-tegra: kirkstone-l4t-r35.x`, que es la rama para Jetson Orin/Xavier con L4T 35.x y CUDA 11/12. Si el profesor tiene un Jetson Orin o Xavier, sus herramientas de compilación son más nuevas (go-native más reciente, cmake-native más reciente, CUDA 11+), lo que hace que su receta funcione en su entorno aunque no en el nuestro.
+
+---
+
+### Logros parciales durante los intentos
+
+A pesar de no lograr el objetivo de GPU con Ollama, se estableció una base funcional para la siguiente estrategia:
+
+- `nvgpu` confirmado cargado y funcional como driver de kernel del GPU.
+- `tegrastats` instalado y operativo: permite monitoreo en tiempo real de CPU, GPU, memoria y temperatura.
+- Librerías CUDA del runtime instaladas en la imagen: `libcudart.so`, `libcublas.so`, `libcufft.so` y otras en `/usr/local/cuda-10.2/lib/`.
+- `tegra-libraries-cuda` instalado: provee `libcuda.so` en `/usr/lib/`, el bridge entre la API CUDA de userspace y el driver `nvgpu`.
+- Toolchain de compilación completo en la imagen: GCC 9.5 con symlinks (`gcc`, `as`, `ld`, `g++`), cmake 3.16.5, git, wget, binutils completo via `packagegroup-core-buildessential`.
+- Stub `arm_bf16.h` identificado y documentado: GCC 9 no incluye este header de ARMv8.2, necesario para satisfacer el include de código MLX de Ollama/llama.cpp aunque el Cortex-A57 nunca ejecute ese código path.
+- `cuda-nvcc-headers` incorporado a la imagen: provee `cuda_runtime.h`, `cublas_v2.h` y los demás headers de desarrollo de CUDA, que eran el bloqueador final para compilar llama.cpp con CUDA.
+
+---
+
+### El camino actual: llama.cpp con CUDA en la Jetson
+
+Dado que Ollama no puede usar GPU con CUDA 10.2, se adoptó la estrategia de compilar llama.cpp directamente en la Jetson. llama.cpp es el motor de inferencia interno que Ollama usa, y puede operar de forma autónoma como servidor HTTP con API compatible con OpenAI.
+
+**Por qué llama.cpp podría funcionar donde Ollama no puede:**
+
+llama.cpp es el backend de bajo nivel. A diferencia de Ollama, que tiene capas adicionales de abstracción y runners versionados por CUDA, llama.cpp compila directamente contra el CUDA toolkit disponible en el sistema, incluyendo CUDA 10.2. El flag `-DGGML_CUDA=ON` habilita el backend CUDA de GGML, y `-DCMAKE_CUDA_ARCHITECTURES=53` especifica que los kernels se compilen para Maxwell (Compute Capability 5.3). Si la compilación tiene éxito, los kernels CUDA son específicos para el hardware del Jetson Nano y deberían ejecutarse.
+
+**El proceso de compilación on-device:**
+
+La compilación no se hace en Yocto sino directamente en la Jetson al primer arranque, descargando las dependencias necesarias que Dunfell no provee:
+
+1. CMake 3.26.4 para ARM64 (binario pre-compilado de Kitware, ~48MB)
+2. El parche de `cmake_minimum_required(VERSION 3.18)` → `VERSION 3.14` en `ggml/src/ggml-cuda/CMakeLists.txt`
+3. Symlinks de desarrollo de las CUDA libs (`libcudart.so`, `libcublas.so`)
+4. Registro de `/usr/local/cuda-10.2/lib` en ldconfig
+
+Este proceso está automatizado en el script `/usr/local/bin/setup-inference.sh` incluido en la imagen vía `core-image-base.bbappend`.
+
+**Bloqueos históricos y su estado actual:**
+
+| Bloqueador | Estado en imagen anterior | Estado en imagen actual |
+|---|---|---|
+| `cuda_runtime.h` ausente | ✗ Bloqueaba cmake | ✅ Resuelto con `cuda-nvcc-headers` |
+| Symlinks `libcudart.so` sin versión | ✗ Bloqueaba linker | ✅ Creados por `fix_cuda_symlinks` en bbappend |
+| cmake 3.16.5 con `FindCUDAToolkit` | ✗ Bloqueaba configuración | ✅ Se descarga cmake 3.26 en setup script |
+| `arm_bf16.h` ausente | ✗ Bloqueaba compilación de código MLX | ✅ Stub en bbappend |
+| `as` (assembler) sin symlink | ✗ `gcc: fatal error: cannot execute 'as'` | ✅ `binutils-symlinks` en imagen |
+| `gcc` sin symlink | ✗ `gcc: not found` | ✅ `gcc-symlinks` en imagen |
+
+**Resultado esperado si la compilación tiene éxito:**
+
+Al correr `llama-server --model <ruta GGUF> --n-gpu-layers 99`, el proceso debería cargar las capas del modelo en el GPU. En tegrastats, el campo `GR3D_FREQ` debería subir de `0%` durante la inferencia, y `POM_5V_GPU` debería mostrar consumo de energía mayor a 0. La velocidad de generación de tokens debería ser superior a la observada con Ollama en CPU (que era de aproximadamente un token cada 7-10 segundos para gemma2:2b).
+
+**Incertidumbre pendiente:**
+
+La posibilidad de que `nvcc` rechace GCC 9.5 como compilador host sigue siendo un riesgo. NVIDIA documenta GCC 8 como la versión máxima soportada para CUDA 10.2. En la práctica, la versión de nvcc distribuida con L4T 32.7.4 puede tener ese chequeo relajado (NVIDIA customiza el toolchain para sus BSPs). El flag `--allow-unsupported-compiler` puede ser necesario si nvcc retorna un error de versión de compilador durante la compilación de los kernels CUDA.
+
+---
+
+### Errores / Problemas
+
+---
+
+**Error 1: Ollama reporta `library=cpu` incluso con librerías CUDA presentes**
+
+```
+msg="inference compute" id=cpu library=cpu compute="" name=cpu
+```
+
+Causa: el binario oficial `ollama-linux-arm64` no contiene el código de detección de GPU ni los runners de CUDA. Estos son compilados condicionalmente via `-tags cuda` en Go y mediante la compilación de llama.cpp con `-DGGML_CUDA=ON`. Sin ese proceso, el binario solo tiene el runner de CPU integrado.
+
+---
+
+**Error 2: `go generate ./...` no producía output de CUDA**
+
+Al compilar desde fuente con `OLLAMA_DEBUG=1`, `go generate` descargaba módulos y generaba código MLX pero no mostraba ningún mensaje de compilación de runners CUDA. El filtro `grep -iE "cuda|nvcc|cmake"` retornaba vacío.
+
+Causa: Ollama detecta la versión del CUDA toolkit disponible y, al encontrar CUDA 10.2, determina que no hay runner compatible (los runners internos comienzan en `cuda_v12`) y omite la compilación del backend GPU completamente sin mensaje de advertencia.
+
+---
+
+**Error 3: `cmake_minimum_required(VERSION 3.18)` en llama.cpp**
+
+```
+CMake Error at ggml/src/ggml-cuda/CMakeLists.txt:1 (cmake_minimum_required):
+  CMake 3.18 or higher is required. You are running version 3.16.5
+```
+
+Causa: llama.cpp usa `find_package(CUDAToolkit)` que es un módulo de CMake introducido en la versión 3.17. La restricción 3.18 es tanto un requisito de política como de funcionalidad. Se resolvió haciendo un patch de la línea con `sed` y descargando CMake 3.26 como binario pre-compilado para ARM64.
+
+---
+
+**Error 4: `cannot execute 'as': execvp: No such file or directory`**
+
+```
+aarch64-poky-linux-gcc: fatal error: cannot execute 'as': execvp: No such file or directory
+```
+
+Causa: GCC estaba instalado en la imagen vía el paquete `gcc`, pero sin el paquete `binutils` los ejecutables del ensamblador (`as`) y el linker (`ld`) no estaban presentes. En Yocto, `gcc` y `binutils` son paquetes independientes. Además, estaban instalados con el prefijo `aarch64-poky-linux-` sin symlinks de nombre corto. Se resolvió agregando `packagegroup-core-buildessential` y `binutils-symlinks` a `IMAGE_INSTALL`.
+
+---
+
+**Error 5: `cannot find -lcudart` / `cannot find -lcublas`**
+
+```
+/usr/bin/aarch64-poky-linux/bin/ld: cannot find -lcudart
+/usr/bin/aarch64-poky-linux/bin/ld: cannot find -lcublas
+```
+
+Causa: las librerías están instaladas como `libcudart.so.10.2` y `libcublas.so.10` (versiones con número), pero el linker busca `libcudart.so` y `libcublas.so` sin versión al resolver los flags `-lcudart` y `-lcublas`. Los paquetes de meta-tegra no crean los symlinks de desarrollo. Se resolvió creando los symlinks manualmente y automatizando su creación en `fix_cuda_symlinks` dentro del bbappend.
+
+---
+
+**Error 6: `cuda_runtime.h` no encontrado por CMake**
+
+```
+-- Unable to find cuda_runtime.h in "/usr/local/cuda-10.2/include"
+-- Could NOT find CUDAToolkit (missing: CUDAToolkit_INCLUDE_DIR) (found version "10.2.300")
+```
+
+Causa: el paquete `cuda-nvcc` instala solo los headers internos de nvcc (`fatbinary.h`, etc.) pero no los headers del SDK público (`cuda_runtime.h`, `cuda.h`, `cublas_v2.h`). Esos headers son provistos por el paquete separado `cuda-nvcc-headers` en meta-tegra. CMake encontraba las librerías pero no los headers, y `FindCUDAToolkit` falla si no puede verificar la instalación completa. Se resolvió agregando `cuda-nvcc-headers` a `IMAGE_INSTALL`.
+
+---
+
+**Error 7: SRCREV inválido en la receta del profesor**
+
+```
+fatal: remote error: upload-pack: not our ref bbc95e9f26284cc8ca2b9ab8a0a9dd5f63de8e46
+```
+
+El commit `bbc95e9f26284cc8ca2b9ab8a0a9dd5f63de8e46` referenciado en la receta del profesor no existe en `github.com/ollama/ollama`. La receta no podría completar `do_fetch` en ningún entorno. Los commits reales donde `llm/llama.cpp` fue la última modificación (estructura necesaria para el enfoque del profesor) son del período octubre-diciembre 2024 y todos requieren Go 1.22.x, incompatible con go-native 1.14.15 de Yocto Dunfell.
+
+---
+
+**Error 8: go-module 0.9.0 requiere Go 1.22 (bloqueador definitivo de Yocto)**
+
+Verificado empíricamente: todos los commits de Ollama con la estructura `llm/llama.cpp` que hubieran podido usarse en la receta requireen Go 1.22 en su `go.mod`. El go-native de meta-oe en Yocto Dunfell es 1.14.15. Esta brecha de siete versiones mayores hace imposible compilar cualquier versión de Ollama con potencial soporte CUDA 10.2 dentro del entorno de Yocto Dunfell sin modificar la cadena de herramientas del build.
+
+
+### Paso a paso replicable para futuras imágenes, versión 2.0
+
+Una vez que el bootloader de la QSPI ya fue flasheado con `--spi-only`, para las próximas imágenes solo hay que repetir los pasos de la SD.
+
+**Parte 1 — Preparar la imagen en el host**
+
+```bash
+# Crear carpeta limpia y extraer
+mkdir ~/Escritorio/jetson-flash-limpio
+tar -xzf core-image-base-jetson-nano-devkit.tegraflash.tar.gz -C ~/Escritorio/jetson-flash-limpio/
+cd ~/Escritorio/jetson-flash-limpio
+
+# Verificar integridad del ext4
+sudo e2fsck -n core-image-base.ext4
+# Debe decir: clean
+
+# Corregir tamano del ext4 (multiplo de 1MB)
+SIZE=$(stat -c%s core-image-base.ext4)
+REMAINDER=$((SIZE % 1048576))
+if [ $REMAINDER -ne 0 ]; then
+    PADDING=$((1048576 - REMAINDER))
+    dd if=/dev/zero bs=1 count=$PADDING >> core-image-base.ext4
+fi
+echo "Residuo: $(($(stat -c%s core-image-base.ext4) % 1048576)) -- debe ser 0"
+```
+
+**Parte 2 — Flashear el bootloader en la QSPI (solo la primera vez)**
+
+```bash
+# 1. Cortocircuitar pines FC REC y GND del header J40 (pines 3 y 4, revision A02)
+# 2. Conectar Micro-USB entre Jetson y laptop
+
+# Verificar Recovery Mode
+lsusb | grep -i nvidia
+# Debe mostrar: ID 0955:7f21 NVIDIA Corp. APX
+
+# Flashear solo la QSPI
+sudo ./doflash.sh --spi-only
+
+# Quitar el jumper al terminar
+```
+
+**Parte 3 — Generar y flashear la SD**
+
+```bash
+# Generar imagen completa de SD
+sudo ./dosdcard.sh jetson-nano-sdcard.img
+# Responder: yes
+
+# Verificar integridad de la imagen
+sudo losetup -P /dev/loop99 jetson-nano-sdcard.img
+sudo e2fsck -n /dev/loop99p1
+sudo losetup -d /dev/loop99
+# Debe decir: clean
+
+# Identificar la SD (RM=1 en lsblk)
+lsblk -d | grep -v loop
+
+# Desmontar si está montada
+sudo umount -l /dev/sdb1 2>/dev/null
+
+# Limpiar la tabla de particiones
+sudo dd if=/dev/zero of=/dev/sdb bs=512 count=34 status=progress
+sudo dd if=/dev/zero of=/dev/sdb bs=512 seek=121802718 count=34 status=progress
+sync
+
+# Verificar que el kernel ve 58GB
+sudo fdisk -l /dev/sdb | grep "GiB"
+# Debe mostrar: 58,08 GiB
+
+# Flashear
+sudo dd if=jetson-nano-sdcard.img of=/dev/sdb bs=4M status=progress conv=fsync
+sync
+
+# Reparar checksums
+sudo umount -l /dev/sdb1 2>/dev/null
+sudo e2fsck -y /dev/sdb1
+
+# Verificar
+sudo mount /dev/sdb1 /mnt/jetson-sd
+ls /mnt/jetson-sd
+sudo umount /mnt/jetson-sd
+# Debe mostrar: bin boot etc home usr var
+```
+
+**Parte 4 — Arrancar la Jetson**
+
+```bash
+# 1. Insertar la SD en el slot microSD de la Jetson
+# 2. Confirmar que NO hay jumper en pines FC REC y GND
+# 3. Conectar monitor por HDMI
+# 4. Conectar alimentacion por Micro-USB
+# 5. Esperar 1-2 minutos
+
+# En el monitor deberia aparecer:
+# - Logo de NVIDIA
+# - Mensajes de boot de Linux
+# - Banner show-ip con la IP de eth0
+# - Prompt de autologin de root
+
+# Conectarse por SSH desde la laptop
+ssh root@<IP_DE_LA_JETSON>
+```
