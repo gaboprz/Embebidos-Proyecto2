@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Diagnóstico Fitosanitario - Banano AI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            color: white;
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+        .content { padding: 30px; }
+        .mode-btn {
+            padding: 12px 24px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #667eea;
+            border-radius: 25px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        .mode-btn.active {
+            background: #667eea;
+            color: white;
+        }
+        .upload-zone {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 50px 20px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            margin: 20px 0;
+        }
+        .upload-zone img {
+            max-width: 100%;
+            max-height: 300px;
+            margin-top: 20px;
+            border-radius: 10px;
+        }
+        .text-input {
+            width: 100%;
+            padding: 18px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 1rem;
+            resize: vertical;
+            min-height: 120px;
+            margin-bottom: 20px;
+        }
+        .btn-analyze {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            cursor: pointer;
+        }
+        .loading { text-align: center; padding: 40px; display: none; }
+        .loading.show { display: block; }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .results {
+            margin-top: 30px;
+            padding: 25px;
+            background: #f8f9ff;
+            border-radius: 15px;
+            display: none;
+        }
+        .results.show { display: block; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🍌 Diagnóstico Fitosanitario</h1>
+            <p>Sistema inteligente de reconocimiento de enfermedades en banano</p>
+        </div>
+        <div class="content">
+            <div style="text-align: center; margin-bottom: 20px;">
+                <button class="mode-btn active" data-mode="image">📷 Imagen</button>
+                <button class="mode-btn" data-mode="text">✍️ Texto</button>
+                <button class="mode-btn" data-mode="multimodal">🔄 Ambos</button>
+            </div>
+            <div class="upload-zone" id="uploadZone">
+                <p>📸 Arrastra una imagen o haz clic</p>
+                <input type="file" id="fileInput" accept="image/*" class="hidden">
+                <img id="preview" class="hidden">
+            </div>
+            <textarea id="textInput" class="text-input hidden" placeholder="Describe los síntomas..."></textarea>
+            <button class="btn-analyze" id="analyzeBtn">🔍 Analizar</button>
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Analizando...</p>
+            </div>
+            <div class="results" id="results">
+                <h3>🦠 Diagnóstico: <span id="diagnosis"></span></h3>
+                <p><strong>Confianza:</strong> <span id="confidence"></span></p>
+                <p><strong>Recomendación:</strong> <span id="recommendations"></span></p>
+            </div>
+        </div>
+    </div>
+    <script>
+        let currentMode = 'image';
+        let selectedFile = null;
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const preview = document.getElementById('preview');
+        const textInput = document.getElementById('textInput');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentMode = btn.dataset.mode;
+                if (currentMode === 'image') {
+                    uploadZone.classList.remove('hidden');
+                    textInput.classList.add('hidden');
+                } else if (currentMode === 'text') {
+                    uploadZone.classList.add('hidden');
+                    textInput.classList.remove('hidden');
+                } else {
+                    uploadZone.classList.remove('hidden');
+                    textInput.classList.remove('hidden');
+                }
+            });
+        });
+        
+        uploadZone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                selectedFile = file;
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    preview.src = e.target.result;
+                    preview.classList.remove('hidden');
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+        
+        analyzeBtn.addEventListener('click', async () => {
+            const formData = new FormData();
+            if (selectedFile && (currentMode === 'image' || currentMode === 'multimodal')) {
+                formData.append('image', selectedFile);
+            }
+            if (textInput.value && (currentMode === 'text' || currentMode === 'multimodal')) {
+                formData.append('text', textInput.value);
+            }
+            
+            document.getElementById('loading').classList.add('show');
+            document.getElementById('results').classList.remove('show');
+            
+            try {
+                const response = await fetch('/diagnose', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                document.getElementById('diagnosis').textContent = data.enfermedad;
+                document.getElementById('confidence').textContent = Math.round(data.confianza * 100) + '%';
+                document.getElementById('recommendations').textContent = data.recomendacion;
+                document.getElementById('results').classList.add('show');
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                document.getElementById('loading').classList.remove('show');
+            }
+        });
+    </script>
+</body>
+</html>
