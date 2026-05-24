@@ -1130,6 +1130,7 @@ El commit `bbc95e9f26284cc8ca2b9ab8a0a9dd5f63de8e46` referenciado en la receta d
 
 Verificado empíricamente: todos los commits de Ollama con la estructura `llm/llama.cpp` que hubieran podido usarse en la receta requireen Go 1.22 en su `go.mod`. El go-native de meta-oe en Yocto Dunfell es 1.14.15. Esta brecha de siete versiones mayores hace imposible compilar cualquier versión de Ollama con potencial soporte CUDA 10.2 dentro del entorno de Yocto Dunfell sin modificar la cadena de herramientas del build.
 
+---
 
 ### Paso a paso replicable para futuras imágenes, versión 2.0
 
@@ -1234,3 +1235,1332 @@ sudo umount /mnt/jetson-sd
 # Conectarse por SSH desde la laptop
 ssh root@<IP_DE_LA_JETSON>
 ```
+
+---
+
+## **Fecha: 23/05/2026 — 24/05/2026**
+
+Esta etapa documenta todos los intentos para compilar y ejecutar llama.cpp con aceleración GPU en la Jetson Nano P3450, usando los núcleos CUDA del GPU Maxwell. Es la continuación directa de la etapa anterior en la que se determinó que Ollama no puede usar GPU en este hardware. Se describe cada intento, por qué falló y cómo se resolvió, llegando finalmente a una solución funcional con inferencia verificada en GPU.
+
+---
+
+### Contexto de partida
+
+Habiendo descartado Ollama con GPU (documentado en la bitácora anterior), se adoptó llama.cpp como motor de inferencia directo. llama.cpp es el backend de C++/CUDA que Ollama usa internamente, pero puede operarse de forma autónoma. La ventaja es que compila directamente contra el CUDA toolkit disponible en el sistema (10.2) sin capas de abstracción que filtren versiones antiguas.
+
+El entorno al inicio de esta etapa:
+- Imagen Yocto Dunfell sobre Jetson Nano P3450
+- GCC 9.5.0, cmake 3.16.5, git, wget instalados en imagen
+- CUDA 10.2 con nvcc en `/usr/local/cuda-10.2/bin/nvcc`
+- Librerías compartidas CUDA en `/usr/local/cuda-10.2/lib/`
+- Modelo gemma2:2b en GGUF disponible en `/root/.ollama/models/blobs/`
+
+---
+
+### Intento 1 — Versión latest de llama.cpp con setup-inference.sh original
+
+El script `setup-inference.sh` instalado en la imagen hacía `git clone` del branch `main` de llama.cpp (versión más reciente a la fecha: mayo 2026, alrededor del build b5600+). El cmake se configuró con:
+
+```bash
+cmake -B build \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=53 \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda-10.2/bin/nvcc \
+    -DCUDAToolkit_ROOT=/usr/local/cuda-10.2 \
+    -DCMAKE_C_COMPILER=/usr/bin/aarch64-poky-linux-gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/aarch64-poky-linux-g++
+```
+
+**Error: cmake 3.16.5 rechaza el CMakeLists.txt**
+
+```
+CMake 3.18 or higher is required. You are running version 3.16.5
+```
+
+llama.cpp moderno usa `FindCUDAToolkit.cmake`, módulo introducido en CMake 3.17. El cmake-native de Yocto Dunfell es 3.16.5 y no puede actualizarse trivialmente.
+
+**Solución:** Descargar cmake 3.26.4 para ARM64 como binario pre-compilado de Kitware:
+
+```bash
+wget https://github.com/Kitware/CMake/releases/download/v3.26.4/cmake-3.26.4-linux-aarch64.tar.gz
+tar -xzf cmake-3.26.4-linux-aarch64.tar.gz -C /usr/local/
+ln -sf /usr/local/cmake-3.26.4-linux-aarch64/bin/cmake /usr/local/bin/cmake
+```
+
+---
+
+### Intento 2 — cmake 3.26 + CUDA headers faltantes
+
+Con cmake 3.26 disponible, se repitió la configuración. Resultado:
+
+```
+-- Could NOT find CUDAToolkit (missing: CUDAToolkit_INCLUDE_DIR)
+-- Unable to find cuda_runtime.h in "/usr/local/cuda-10.2/include"
+```
+
+cmake encontraba nvcc y las librerías pero no los headers del SDK. El paquete `cuda-nvcc-headers` instalado en la imagen solo provee 14 headers internos de nvcc (como `fatbinary.h`), no el SDK público.
+
+**Diagnóstico:** En el contenedor Yocto, la imagen sí tenía los headers en staging pero no estaban instalados en el rootfs:
+
+```bash
+find /home/yoctouser/yocto-workspace/poky/build/tmp \
+    -name "cuda_runtime.h" 2>/dev/null | head -3
+# Retorna: .../cuda-libraries/.../recipe-sysroot/.../include/cuda_runtime.h
+```
+
+**Solución temporal (SCP desde build machine):**
+
+```bash
+# Desde el host
+JETSON_IP="10.42.0.203"
+HEADERS_DIR=$(find $(pwd)/yocto-workspace -name "cuda_runtime.h" | head -1 | xargs dirname)
+scp -r "$HEADERS_DIR"/* root@${JETSON_IP}:/usr/local/cuda-10.2/include/
+```
+
+Esto copió ~800 headers al dispositivo. La solución permanente es agregar `cuda-cudart-dev` a `IMAGE_INSTALL` en Yocto (ver sección Tutorial).
+
+---
+
+### Intento 3 — GCC 9.5 rechazado por nvcc
+
+Con los headers disponibles, cmake encontró CUDA pero falló al intentar compilar el programa de identificación del compilador:
+
+```
+/usr/local/cuda-10.2/include/crt/host_config.h:138:2: error:
+#error -- unsupported GNU version! gcc versions later than 8 are not supported!
+```
+
+CUDA 10.2 tiene una verificación de preprocesador en `host_config.h`:
+```c
+#if __GNUC__ > 8
+#error -- unsupported GNU version! gcc versions later than 8 are not supported!
+```
+
+La imagen Yocto Dunfell usa GCC 9.5. La versión máxima soportada oficialmente por CUDA 10.2 es GCC 8.
+
+**Solución:** Parchear `host_config.h` para cambiar el umbral de 8 a 9:
+
+```bash
+sed -i 's/__GNUC__ > 8/__GNUC__ > 9/' \
+    /usr/local/cuda-10.2/include/crt/host_config.h
+```
+
+En la práctica, GCC 9.x genera código compatible con lo que CUDA 10.2 necesita. La diferencia entre GCC 8 y GCC 9 para el código de host de CUDA es mínima.
+
+---
+
+### Intento 4 — Librerías estáticas ausentes
+
+Superado el problema de GCC, cmake avanzó más pero falló en el paso de linkeo del programa de identificación:
+
+```
+cannot find -lcudadevrt
+cannot find -lcudart_static
+```
+
+cmake intenta enlazar un pequeño programa CUDA con librerías estáticas para verificar el compilador. `libcudadevrt.a` y `libcudart_static.a` no estaban instaladas; meta-tegra Dunfell solo empaqueta las librerías dinámicas.
+
+**Diagnóstico desde el contenedor:**
+
+```bash
+find /home/yoctouser/yocto-workspace/poky/build/tmp/deploy/ipk -name "cuda-cudart*"
+# Retorna: cuda-cudart-dev_10.2.300-1-r0_armv8a_tegra.ipk ← contiene las .a
+```
+
+**Extracción del IPK y copia:**
+
+```bash
+# En el contenedor Docker
+mkdir -p /home/yoctouser/yocto-workspace/cuda-static-extract
+cd /home/yoctouser/yocto-workspace/cuda-static-extract
+ar x /home/yoctouser/yocto-workspace/poky/build/tmp/deploy/ipk/armv8a_tegra/cuda-cudart-dev_10.2.300-1-r0_armv8a_tegra.ipk
+tar xJf data.tar.xz
+
+# Desde el host
+cd $(pwd)/yocto-workspace/cuda-static-extract
+find . -name "*.a" -exec scp {} root@10.42.0.203:/usr/local/cuda-10.2/lib/ \;
+```
+
+Se copiaron: `libcudadevrt.a` (664 KB), `libcudart_static.a` (867 KB), `libculibos.a` (32 KB).
+
+---
+
+### Intento 5 — CUDA17 requerido por llama.cpp moderno
+
+Con las librerías estáticas disponibles, cmake logró identificar el compilador CUDA (NVIDIA 10.2.300) pero falló en la fase de generación:
+
+```
+CMake Error in ggml/src/ggml-cuda/CMakeLists.txt:
+  Target "ggml-cuda" requires the language dialect "CUDA17"
+  But the current compiler "NVIDIA" does not support this
+```
+
+llama.cpp moderno requiere C++17 para CUDA. nvcc 10.2 soporta únicamente hasta `--std=c++14`. El archivo `ggml/CMakeLists.txt` establece globalmente `set(CMAKE_CXX_STANDARD 17)`, que cmake propaga al estándar CUDA.
+
+**Intento de solución con preload cmake:**
+
+Se creó un archivo preload que pre-cargaba `CMAKE_CUDA_STANDARD=14` y `CMAKE_CUDA_STANDARD_REQUIRED=OFF`, el cual fue suficiente para pasar la fase de cmake. Sin embargo, la compilación falló con:
+
+```
+nvcc fatal   : Value 'c++17' is not defined for option 'std'
+```
+
+`nvcc 10.2` no acepta `--std=c++17`. El compilador solo soporta `c++03`, `c++11`, `c++14`.
+
+**Intento de solución con compat header para `std::is_same_v`:**
+
+Se intentó forzar C++14 en la compilación. llama.cpp moderno usa `std::is_same_v<T,U>` (C++17) en sus kernels CUDA y structured bindings en `allreduce.cu`:
+
+```cpp
+const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);  // structured binding C++17
+```
+
+Estos problemas son estructurales — no parcheable sin reescribir código. La versión actual (mayo 2026) de llama.cpp requiere fundamentalmente CUDA 11+ y C++17 en CUDA.
+
+**Conclusión:** La versión latest de llama.cpp no puede compilarse con CUDA 10.2.
+
+---
+
+### Solución definitiva — llama.cpp b5050 (referencia al gist de kreier)
+
+Durante la investigación se encontró el siguiente recurso:
+
+> **Jetson Nano with current llama.cpp and GPU CUDA support**
+> https://gist.github.com/kreier/6871691130ec3ab907dd2815f9313c5d
+>
+> Autor: kreier | Última actualización: mayo 2026 | 10 estrellas
+
+El gist documenta exactamente el problema: compilar llama.cpp con `gcc 8.5` y `nvcc 10.2` en la Jetson Nano 2019. La clave fue usar el commit específico **b5050** (`23106f94e`) de abril 2025, que es la última versión probada y compatible. Versiones posteriores rompen la compatibilidad con CUDA 10.2.
+
+El gist fue escrito para GCC 8.5 en Ubuntu. Nosotros lo adaptamos para GCC 9.5 en Yocto, con los ajustes necesarios.
+
+---
+
+### Implementación de la solución b5050
+
+#### Paso 1 — Clonar el commit exacto
+
+```bash
+cd /tmp
+git clone https://github.com/ggml-org/llama.cpp llama.cpp
+cd llama.cpp
+git checkout 23106f9
+git checkout -b llamaJetsonNanoCUDA
+```
+
+#### Paso 2 — Seis parches de compatibilidad
+
+**Parche 1 — CMakeLists.txt: forzar arquitectura CUDA sm_53**
+```bash
+sed -i '14a if(NOT DEFINED ${CMAKE_CUDA_ARCHITECTURES})\n    set(CMAKE_CUDA_ARCHITECTURES 53)\nendif()' CMakeLists.txt
+```
+
+**Parche 2 — ggml/CMakeLists.txt: linker DT entries (sin stdc++fs para GCC 9+)**
+
+El gist original agrega tanto `target_link_libraries(ggml PRIVATE stdc++fs)` como `add_link_options(...)`. Con GCC 9.5 en Yocto, `libstdc++fs` no existe como librería separada (está integrada en `libstdc++`). Se agrega solo la segunda línea:
+
+```bash
+sed -i '/set_target_properties(ggml PROPERTIES PUBLIC_HEADER/a add_link_options(-Wl,--copy-dt-needed-entries)' ggml/CMakeLists.txt
+```
+
+Si se agrega la línea de `stdc++fs` (como indica el gist para GCC 8.5), la compilación falla con `cannot find -lstdc++fs`. La solución es no agregarla en GCC 9.5.
+
+**Parche 3 — common.cuh línea 455: quitar constexpr**
+```bash
+sed -i '455s/static constexpr __device__/static __device__/' \
+    ggml/src/ggml-cuda/common.cuh
+```
+
+**Parches 4, 5, 6 — Comentar `__builtin_assume` en tres archivos**
+```bash
+sed -i '623s/__builtin_assume/\/\/__builtin_assume/' \
+    ggml/src/ggml-cuda/fattn-common.cuh
+sed -i '71s/__builtin_assume/\/\/__builtin_assume/' \
+    ggml/src/ggml-cuda/fattn-vec-f32.cuh
+sed -i '73s/__builtin_assume/\/\/__builtin_assume/' \
+    ggml/src/ggml-cuda/fattn-vec-f16.cuh
+```
+
+**Prerequisito — Stub cuda_bf16.h (en el sistema, no en llama.cpp)**
+
+b5050 incluye soporte incipiente para bfloat16 que importa `cuda_bf16.h`. CUDA 10.2 no incluye este header. El gist propone la Opción A: crear un stub que mapea `nv_bfloat16` como alias de `half` (FP16):
+
+```bash
+cat > /usr/local/cuda-10.2/include/cuda_bf16.h << 'EOF'
+#ifndef CUDA_BF16_H
+#define CUDA_BF16_H
+#include <cuda_fp16.h>
+typedef half nv_bfloat16;
+typedef half2 nv_bfloat162;
+#endif
+EOF
+
+cat > /usr/local/cuda-10.2/include/cuda_bf16.hpp << 'EOF'
+#ifndef CUDA_BF16_HPP
+#define CUDA_BF16_HPP
+#include "cuda_bf16.h"
+#endif
+EOF
+```
+
+#### Paso 3 — cmake
+
+```bash
+export PATH=/usr/local/cmake-3.26.4-linux-aarch64/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+cmake -B build \
+    -DGGML_CUDA=ON \
+    -DLLAMA_CURL=OFF \
+    -DCMAKE_CUDA_STANDARD=14 \
+    -DCMAKE_CUDA_STANDARD_REQUIRED=true \
+    -DGGML_CPU_ARM_ARCH=armv8-a \
+    -DGGML_NATIVE=off \
+    -DCMAKE_CUDA_ARCHITECTURES=53 \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda-10.2/bin/nvcc \
+    -DCUDAToolkit_ROOT=/usr/local/cuda-10.2 \
+    -DCMAKE_C_COMPILER=/usr/bin/aarch64-poky-linux-gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/aarch64-poky-linux-g++ \
+    -DCMAKE_CUDA_RUNTIME_LIBRARY=SHARED
+```
+
+Output confirmatorio:
+```
+-- Found CUDAToolkit: /usr/local/cuda-10.2/include (found version "10.2.300")
+-- The CUDA compiler identification is NVIDIA 10.2.300
+-- CUDA host compiler is GNU 9.5.0
+-- Including CUDA backend
+-- Configuring done (8.4s)
+-- Build files have been written to: /tmp/llama.cpp/build
+```
+
+#### Paso 4 — Compilación (~85 minutos)
+
+```bash
+cmake --build build --config Release -j4
+```
+
+Los kernels CUDA se compilan con advertencias de C++17 (modo extensión de nvcc) pero sin errores:
+```
+warning: constexpr if statements are a C++17 feature
+```
+Estas advertencias son inofensivas.
+
+**Problema: `-lstdc++fs` en Makefile generado**
+
+Si en algún momento se había agregado `stdc++fs` al CMakeLists.txt (error previo), puede quedar cacheado en el Makefile generado. El linker falla con:
+
+```
+cannot find -lstdc++fs
+```
+
+Diagnóstico y fix sin recompilar los kernels CUDA:
+
+```bash
+find /tmp/llama.cpp/build/ -type f | xargs grep -l "stdc++fs" 2>/dev/null | \
+    while read f; do sed -i 's/-lstdc++fs//g' "$f"; done
+cmake --build build --config Release -j4
+```
+
+#### Compilación exitosa
+
+```
+[ 37%] Built target ggml-cuda  ← kernels CUDA compilados
+...
+[100%] Built target llama-server
+[100%] Built target llama-cli
+```
+
+---
+
+### Verificación de GPU
+
+**Arranque de llama-cli:**
+```
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA Tegra X1, compute capability 5.3, VMM: no
+load_tensors: offloaded 27/27 layers to GPU
+load_tensors:   CPU_Mapped model buffer size =   461.43 MiB
+load_tensors:        CUDA0 model buffer size =  1548.29 MiB
+```
+
+**tegrastats durante inferencia:**
+```
+GR3D_FREQ 99%@921  ← GPU al 99% de uso
+POM_5V_GPU 2256/1  ← GPU consumiendo 2.256 Watts
+RAM 2592/3961MB    ← modelo cargado en memoria unificada
+```
+
+La inferencia demostró uso real del GPU. Velocidad aproximada:
+- Prompt processing: ~116 tokens/segundo
+- Token generation: ~5.9 tokens/segundo
+
+Comparación con CPU (Ollama sin GPU): ~1 token cada 7-10 segundos. La aceleración GPU representa **aproximadamente 20% de mejora en generación** y un orden de magnitud en procesamiento de prompt.
+
+---
+
+### Configuración óptima de uso
+
+El modelo gemma2:2b en Q4_0 ocupa ~1548 MB en GPU. La Jetson Nano tiene 4 GB de memoria compartida CPU/GPU. La gestión de contexto es crítica:
+
+| Contexto `-c` | KV cache GPU | `-ub` recomendado | Estado |
+|---|---|---|---|
+| 256 | 26 MB | default | ✅ Estable |
+| 512 | 52 MB | 64 | ✅ Estable |
+| 1024 | 104 MB | 64 | ✅ Probado |
+| 2048 | 208 MB | 64 | ✅ Probado |
+| 4096 | 416 MB | 64 | ⚠️ Requiere verificación |
+
+**Nunca ejecutar dos instancias simultáneamente.** Antes de iniciar llama-cli o llama-server, siempre:
+
+```bash
+pkill -9 -f llama-cli 2>/dev/null
+pkill -9 -f llama-server 2>/dev/null
+sleep 1
+```
+
+Comando de uso estándar verificado:
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+/tmp/llama.cpp/build/bin/llama-cli \
+    --model /root/.ollama/models/blobs/sha256-7462734796d67c40ecec2ca98eddf970e171dbb6b370e43fd633ee75b69abe1b \
+    --n-gpu-layers 99 \
+    -c 512 \
+    -ub 64 \
+    -n 400
+```
+
+---
+
+### Errores / Problemas
+
+---
+
+**Error 1: cmake versión insuficiente**
+```
+CMake 3.18 or higher is required. You are running version 3.16.5
+```
+Causa: cmake-native de Yocto Dunfell. Solución: descargar cmake 3.26 ARM64 pre-compilado.
+
+---
+
+**Error 2: cuda_runtime.h no encontrado**
+```
+-- Could NOT find CUDAToolkit (missing: CUDAToolkit_INCLUDE_DIR)
+```
+Causa: `cuda-nvcc-headers` solo instala headers internos de nvcc (14 archivos), no el SDK. Solución: agregar `cuda-cudart-dev` a IMAGE_INSTALL en Yocto, o copiar headers manualmente desde el staging del build.
+
+---
+
+**Error 3: GCC 9.5 rechazado por nvcc**
+```
+#error -- unsupported GNU version! gcc versions later than 8 are not supported!
+```
+Causa: check de preprocesador en `crt/host_config.h`. Solución: `sed -i 's/__GNUC__ > 8/__GNUC__ > 9/' /usr/local/cuda-10.2/include/crt/host_config.h`.
+
+---
+
+**Error 4: librerías estáticas CUDA ausentes**
+```
+cannot find -lcudadevrt
+cannot find -lcudart_static
+```
+Causa: meta-tegra Dunfell solo empaqueta librerías dinámicas. Las estáticas están en `cuda-cudart-dev_10.2.300-1-r0_armv8a_tegra.ipk` (en el deploy de Yocto). Solución: extraer el IPK con `ar x` y copiar los `.a` al dispositivo.
+
+---
+
+**Error 5: CUDA17 requerido por llama.cpp moderno (bloqueador definitivo)**
+```
+Target "ggml-cuda" requires the language dialect "CUDA17"
+nvcc fatal   : Value 'c++17' is not defined for option 'std'
+```
+Causa: llama.cpp post-octubre 2024 requiere C++17 para CUDA. nvcc 10.2 soporta hasta C++14. Además, código con `std::is_same_v` y structured bindings C++17 son incompatibles con modo C++14. Solución: usar commit b5050 (23106f94e) que es la última versión compatible.
+
+---
+
+**Error 6: cuda_bf16.h no encontrado**
+```
+cuda_bf16.h: No such file or directory
+```
+Causa: CUDA 10.2 no incluye el header BFloat16. llama.cpp b5050 lo referencia en `vendors/cuda.h`. Solución: crear stub que mapea `nv_bfloat16` a `half` (FP16).
+
+---
+
+**Error 7: -lstdc++fs no encontrado**
+```
+/usr/lib/gcc/aarch64-poky-linux/9.5.0/.../ld: cannot find -lstdc++fs
+```
+Causa: El gist original (diseñado para GCC 8.5) agrega `target_link_libraries(ggml PRIVATE stdc++fs)`. En GCC 9+, `libstdc++fs` está integrada en `libstdc++` y no existe como librería separada. Solución: no agregar esa línea al `ggml/CMakeLists.txt` cuando se usa GCC 9.5. Si ya se agregó, limpiar con `sed -i 's/-lstdc++fs//g'` en los Makefiles generados.
+
+---
+
+**Error 8: OOM Killer — Killed durante inferencia con contexto grande**
+```
+Killed
+```
+Causa: memoria insuficiente. Con contexto 4096, el KV cache GPU es 416 MB + compute buffer ~500 MB + modelo 1548 MB + CPU overhead = supera el pool de 4 GB. Solución: usar `-c 512` o menor, y `-ub 64` para reducir el compute buffer temporal.
+
+---
+
+**Error 9: Dos instancias simultáneas**
+```
+[1]-  Killed   llama-cli (proceso anterior)
+Killed
+```
+Causa: iniciar una segunda sesión de llama-cli mientras la primera sigue corriendo en background. Ambas intentan cargar 2+ GB de modelo GPU simultáneamente. Solución: `pkill -9 -f llama-cli` antes de iniciar nueva sesión.
+
+---
+---
+
+## Tutorial — Automatización y primer arranque
+
+Este tutorial describe los cambios necesarios en Yocto para generar una imagen que se configure automáticamente para usar llama.cpp con GPU en el primer arranque, sin necesidad de intervención manual para preparar el entorno CUDA.
+
+---
+
+### Visión general
+
+La imagen nueva incluirá:
+- Todos los headers CUDA (`cuda-cudart-dev` en lugar de solo `cuda-nvcc-headers`)
+- Librerías estáticas CUDA (`libcudadevrt.a`, `libcudart_static.a`) vía el mismo paquete
+- Stub `cuda_bf16.h` y `cuda_bf16.hpp` creados en el rootfs
+- Symlink `lib64` → `lib` en `/usr/local/cuda-10.2/`
+- `host_config.h` parcheado para GCC 9.5
+- Script `setup-llama.sh` instalado en `/usr/local/bin/` que automatiza la compilación de b5050
+- Servicio systemd opcional `llama-setup.service` que ejecuta el setup en el primer boot
+
+El proceso on-device (que requiere internet) queda para el script:
+1. Descargar cmake 3.26 (~48 MB)
+2. Clonar llama.cpp b5050 (~400 MB)
+3. Compilar (~85 minutos, solo la primera vez)
+
+---
+
+### Cambio 1 — local.conf
+
+En `/home/yoctouser/yocto-workspace/poky/build/conf/local.conf`, hacer el siguiente cambio:
+
+**Reemplazar:**
+```bitbake
+IMAGE_INSTALL_append = " cuda-nvcc-headers cuda-nvcc"
+```
+
+**Por:**
+```bitbake
+IMAGE_INSTALL_append = " cuda-cudart-dev cuda-nvcc"
+```
+
+`cuda-cudart-dev` provee tanto los headers del SDK (`cuda_runtime.h`, `cublas_v2.h`, etc.) como las librerías estáticas (`libcudadevrt.a`, `libcudart_static.a`). `cuda-nvcc-headers` queda obsoleto con este cambio.
+
+---
+
+### Cambio 2 — core-image-base.bbappend
+
+En `meta-ai/recipes-core/images/core-image-base.bbappend`, modificar la función `fix_cuda_symlinks` y la función `install_setup_script`:
+
+**Reemplazar la versión actual de la función `fix_cuda_symlinks` por la acá mostrada:**
+
+```bash
+fix_cuda_symlinks() {
+    # Los paquetes instalan libcudart.so.10.2 pero el linker necesita
+    # libcudart.so sin versión para resolver -lcudart al compilar llama.cpp.
+    CUDA_LIB="${IMAGE_ROOTFS}/usr/local/cuda-10.2/lib"
+    if [ ! -d "${CUDA_LIB}" ]; then
+        bbwarn "fix_cuda_symlinks: directorio CUDA lib no encontrado."
+        return 0
+    fi
+    for versioned in "${CUDA_LIB}"/lib*.so.[0-9]*; do
+        [ -f "${versioned}" ] || continue
+        base=$(basename "${versioned}" | sed 's/\.so\.[0-9].*/.so/')
+        [ -f "${CUDA_LIB}/${base}" ] || \
+            ln -sf "$(basename ${versioned})" "${CUDA_LIB}/${base}"
+    done
+
+    # ldconfig para que el linker dinámico encuentre las CUDA libs en runtime
+    install -d "${IMAGE_ROOTFS}/etc/ld.so.conf.d"
+    echo "/usr/local/cuda-10.2/lib" > \
+        "${IMAGE_ROOTFS}/etc/ld.so.conf.d/cuda.conf"
+
+    # Stub arm_bf16.h — GCC 9 no lo incluye.
+    GCC_INC="${IMAGE_ROOTFS}/usr/lib/gcc/aarch64-poky-linux/9.5.0/include"
+    install -d "${GCC_INC}"
+    cat > "${GCC_INC}/arm_bf16.h" << 'BFEOF'
+/* Stub arm_bf16.h — ARMv8.0 no tiene BF16 nativo, GCC 9 no incluye este header */
+#ifndef __ARM_BF16_H
+#define __ARM_BF16_H
+typedef unsigned short bfloat16_t;
+typedef unsigned short __bf16;
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+typedef uint16x4_t bfloat16x4_t;
+typedef uint16x8_t bfloat16x8_t;
+#endif
+#endif
+BFEOF
+
+    # Symlink lib64 → lib para que nvcc encuentre sus libdevice internas.
+    # nvcc 10.2 busca en lib64/ por defecto; en L4T las libs están en lib/.
+    ln -sf /usr/local/cuda-10.2/lib \
+        "${IMAGE_ROOTFS}/usr/local/cuda-10.2/lib64"
+
+    # Stub cuda_bf16.h y cuda_bf16.hpp — CUDA 10.2 no incluye soporte BFloat16.
+    # llama.cpp b5050 los incluye en vendors/cuda.h aunque Maxwell (sm_53)
+    # no tenga hardware BF16. Se mapea nv_bfloat16 → half (FP16) como alias.
+    CUDA_INC="${IMAGE_ROOTFS}/usr/local/cuda-10.2/include"
+    install -d "${CUDA_INC}"
+    cat > "${CUDA_INC}/cuda_bf16.h" << 'BFEOF'
+/* cuda_bf16.h — stub para CUDA 10.2. BF16 nativo requiere CUDA 11+ / Ampere.
+ * Maxwell sm_53 no tiene instrucciones BF16 nativas; se emula via FP16 (half). */
+#ifndef CUDA_BF16_H
+#define CUDA_BF16_H
+#include <cuda_fp16.h>
+typedef half  nv_bfloat16;
+typedef half2 nv_bfloat162;
+#endif
+BFEOF
+
+    cat > "${CUDA_INC}/cuda_bf16.hpp" << 'BFEOF'
+/* cuda_bf16.hpp — wrapper para cuda_bf16.h */
+#ifndef CUDA_BF16_HPP
+#define CUDA_BF16_HPP
+#include "cuda_bf16.h"
+#endif
+BFEOF
+
+    # Parche host_config.h — CUDA 10.2 rechaza GCC > 8 en tiempo de compilación.
+    # Se cambia el umbral de 8 a 9 para permitir GCC 9.5 (Yocto Dunfell).
+    HOST_CFG="${IMAGE_ROOTFS}/usr/local/cuda-10.2/include/crt/host_config.h"
+    if [ -f "${HOST_CFG}" ]; then
+        sed -i 's/__GNUC__ > 8/__GNUC__ > 9/' "${HOST_CFG}"
+        bbnote "fix_cuda_symlinks: host_config.h parcheado para GCC 9.x"
+    fi
+
+    bbnote "fix_cuda_symlinks: CUDA symlinks, ldconf, arm_bf16.h, lib64, cuda_bf16.h y host_config.h configurados."
+}
+```
+
+**Reemplazar completamente la función `install_setup_script`:**
+
+```bash
+install_setup_script() {
+    install -d ${IMAGE_ROOTFS}/usr/local/bin
+    install -m 0755 ${LLAMA_SCRIPT} \
+        ${IMAGE_ROOTFS}/usr/local/bin/setup-llama.sh
+}
+```
+
+En esta función se copia el contenido de un nuevo archivo presente en `meta-ai/recipes-core/images/files/setup-llama.sh`, el cual es:
+
+```bash
+#!/bin/bash
+# setup-llama.sh — Compila llama.cpp b5050 con CUDA sm_53 en Jetson Nano P3450
+# Requiere: internet en primer arranque, ~85 minutos de compilacion.
+# Referencia: https://gist.github.com/kreier/6871691130ec3ab907dd2815f9313c5d
+
+set -e
+
+LLAMA_BUILD_DIR="/opt/llama.cpp"
+LLAMA_COMMIT="23106f9"
+CMAKE_VERSION="3.26.4"
+CMAKE_DIR="/usr/local/cmake-${CMAKE_VERSION}-linux-aarch64"
+
+log() { echo "[setup-llama] $*"; }
+
+find_model() {
+    local largest="" max=0
+    for f in /root/.ollama/models/blobs/*; do
+        [ -f "$f" ] || continue
+        local size
+        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$max" ]; then max="$size"; largest="$f"; fi
+    done
+    echo "$largest"
+}
+
+log "=== Configurando llama.cpp ${LLAMA_COMMIT} con CUDA sm_53 ==="
+log "Referencia: https://gist.github.com/kreier/6871691130ec3ab907dd2815f9313c5d"
+
+# 1. Verificar prerequisitos CUDA
+log "[1/5] Verificando prerequisitos CUDA..."
+for req in \
+    /usr/local/cuda-10.2/include/cuda_runtime.h \
+    /usr/local/cuda-10.2/lib/libcudadevrt.a \
+    /usr/local/cuda-10.2/lib/libcudart_static.a \
+    /usr/local/cuda-10.2/include/cuda_bf16.h \
+    /usr/local/cuda-10.2/bin/nvcc; do
+    if [ ! -f "$req" ] && [ ! -x "$req" ]; then
+        log "ERROR: falta $req"
+        log "Asegurese de que la imagen incluye cuda-cudart-dev"
+        exit 1
+    fi
+done
+log "CUDA 10.2 prerequisitos OK"
+
+# 2. cmake 3.26
+log "[2/5] Verificando cmake >= 3.18..."
+if ! cmake --version 2>/dev/null | grep -qE "3\.[2-9][0-9]"; then
+    log "Descargando cmake ${CMAKE_VERSION}..."
+    cd /tmp
+    wget -q --show-progress \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz"
+    tar -xzf "cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz" -C /usr/local/
+    ln -sf "${CMAKE_DIR}/bin/cmake" /usr/local/bin/cmake
+    rm -f "cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz"
+fi
+log "$(cmake --version | head -1) disponible"
+
+# Si ya esta compilado, mostrar instrucciones y salir
+if [ -x /usr/local/bin/llama-cli ]; then
+    log "llama-cli ya disponible. Compilacion previa detectada."
+    MODEL_PATH=$(find_model)
+    [ -n "$MODEL_PATH" ] && log "Modelo: $MODEL_PATH"
+    log "Uso: llama-cli --model \"$MODEL_PATH\" --n-gpu-layers 99 -c 512 -ub 64 -n 400"
+    exit 0
+fi
+
+# 3. Clonar b5050
+log "[3/5] Clonando llama.cpp commit ${LLAMA_COMMIT} (b5050)..."
+rm -rf "$LLAMA_BUILD_DIR"
+git clone https://github.com/ggml-org/llama.cpp "$LLAMA_BUILD_DIR"
+cd "$LLAMA_BUILD_DIR"
+git checkout "$LLAMA_COMMIT"
+git checkout -b llamaJetsonNanoCUDA
+
+# 4. Seis parches de compatibilidad CUDA 10.2 + GCC 9.5
+log "[4/5] Aplicando parches de compatibilidad..."
+
+sed -i '14a if(NOT DEFINED ${CMAKE_CUDA_ARCHITECTURES})\n    set(CMAKE_CUDA_ARCHITECTURES 53)\nendif()' \
+    CMakeLists.txt
+
+sed -i '/set_target_properties(ggml PROPERTIES PUBLIC_HEADER/a add_link_options(-Wl,--copy-dt-needed-entries)' \
+    ggml/CMakeLists.txt
+
+sed -i '455s/static constexpr __device__/static __device__/' \
+    ggml/src/ggml-cuda/common.cuh
+
+sed -i '623s/__builtin_assume/\/\/__builtin_assume/' ggml/src/ggml-cuda/fattn-common.cuh
+sed -i '71s/__builtin_assume/\/\/__builtin_assume/'  ggml/src/ggml-cuda/fattn-vec-f32.cuh
+sed -i '73s/__builtin_assume/\/\/__builtin_assume/'  ggml/src/ggml-cuda/fattn-vec-f16.cuh
+
+log "Parches aplicados OK"
+
+# 5. Compilar
+log "[5/5] Compilando (~85 minutos)..."
+export PATH="${CMAKE_DIR}/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-10.2/lib:/usr/lib:${LD_LIBRARY_PATH}"
+
+cmake -B build \
+    -DGGML_CUDA=ON \
+    -DLLAMA_CURL=OFF \
+    -DCMAKE_CUDA_STANDARD=14 \
+    -DCMAKE_CUDA_STANDARD_REQUIRED=true \
+    -DGGML_CPU_ARM_ARCH=armv8-a \
+    -DGGML_NATIVE=off \
+    -DCMAKE_CUDA_ARCHITECTURES=53 \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda-10.2/bin/nvcc \
+    -DCUDAToolkit_ROOT=/usr/local/cuda-10.2 \
+    -DCMAKE_C_COMPILER=/usr/bin/aarch64-poky-linux-gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/aarch64-poky-linux-g++ \
+    -DCMAKE_CUDA_RUNTIME_LIBRARY=SHARED
+
+find build/ -type f 2>/dev/null | \
+    xargs grep -l "stdc++fs" 2>/dev/null | \
+    while read f; do sed -i 's/-lstdc++fs//g' "$f"; done
+
+cmake --build build --config Release -j4
+
+install -m 0755 build/bin/llama-cli    /usr/local/bin/llama-cli
+install -m 0755 build/bin/llama-server /usr/local/bin/llama-server
+install -m 0755 build/bin/llama-bench  /usr/local/bin/llama-bench
+
+log "=== Compilacion exitosa. Binarios en /usr/local/bin/ ==="
+
+MODEL_PATH=$(find_model)
+if [ -n "$MODEL_PATH" ]; then
+    log "Modelo: $MODEL_PATH"
+    log "Uso GPU: llama-cli --model \"$MODEL_PATH\" --n-gpu-layers 99 -c 512 -ub 64 -n 400"
+fi
+```
+
+---
+
+### Cambio 3 — Servicio systemd de primer arranque (opcional)
+
+Si se desea que la compilación se inicie automáticamente en el primer boot (sin intervención del usuario), agregar en el bbappend:
+
+```bash
+install_llama_service() {
+    install -d ${D}${systemd_system_unitdir}
+
+    cat > ${D}${systemd_system_unitdir}/llama-setup.service << 'SVCEOF'
+[Unit]
+Description=Compilación inicial de llama.cpp con CUDA
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/usr/local/bin/llama-cli
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-llama.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+}
+```
+
+Y en el `ROOTFS_POSTPROCESS_COMMAND`:
+```
+ROOTFS_POSTPROCESS_COMMAND += "install_llama_service; "
+```
+
+`ConditionPathExists=!/usr/local/bin/llama-cli` hace que el servicio solo ejecute si `llama-cli` no existe, es decir, solo en el primer arranque.
+
+---
+
+### Procedimiento completo para nuevos builds
+
+#### Paso 1 — Aplicar cambios en el contenedor Yocto
+
+```bash
+# Entrar al contenedor
+docker start yocto-ia-jetson
+docker exec -it yocto-ia-jetson /bin/bash
+
+cd /home/yoctouser/yocto-workspace/poky/build
+```
+
+Editar `conf/local.conf` para reemplazar `cuda-nvcc-headers` por `cuda-cudart-dev`.
+
+Editar `meta-ai/recipes-core/images/core-image-base.bbappend` con los cambios descritos.
+
+#### Paso 2 — Construir la imagen
+
+```bash
+bitbake core-image-base 2>&1 | tee /tmp/build.log
+```
+
+La imagen ya tiene todos los prerequisitos CUDA baked. El tamaño del rootfs aumenta ligeramente por los headers adicionales (~30 MB).
+
+#### Paso 3 — Flashear la SD
+
+```bash
+# Desde el host, obtener la imagen resultante
+ls $(pwd)/yocto-workspace/poky/build/tmp/deploy/images/jetson-nano-devkit/*.tegraflash.tar.gz
+
+# Flashear siguiendo el procedimiento estándar de L4T
+```
+
+#### Paso 4 — Primer arranque en la Jetson
+
+Con acceso a internet (Ethernet conectado), ejecutar una sola vez:
+
+```bash
+setup-llama.sh 2>&1 | tee /tmp/setup-llama-log.txt
+```
+
+La compilación tarda ~85 minutos. El progreso se ve como:
+
+```
+[setup-llama] === Configurando llama.cpp 23106f9 con CUDA sm_53 ===
+[setup-llama] [1/5] Verificando prerequisitos CUDA...
+[setup-llama] CUDA 10.2 prerequisitos OK
+[setup-llama] [2/5] Verificando cmake >= 3.18...
+[setup-llama] Descargando cmake 3.26.4 para aarch64...
+[setup-llama] [3/5] Clonando llama.cpp commit 23106f9...
+[setup-llama] [4/5] Aplicando parches de compatibilidad...
+[setup-llama] [5/5] Compilando llama.cpp con CUDA sm_53 (~85 minutos)...
+...
+[ 37%] Built target ggml-cuda
+...
+[100%] Built target llama-server
+[setup-llama] === Compilación exitosa ===
+```
+
+#### Paso 5 — Verificar GPU
+
+En una terminal secundaria, monitorear durante la compilación y especialmente durante la primera inferencia:
+
+```bash
+tegrastats --interval 1000
+```
+
+**Prueba de inferencia:**
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+MODEL=$(for f in /root/.ollama/models/blobs/*; do
+    echo "$(wc -c < $f 2>/dev/null) $f"
+done | sort -rn | head -1 | awk '{print $2}')
+
+llama-cli --model "$MODEL" \
+    --n-gpu-layers 99 \
+    -c 256 \
+    -ub 64 \
+    -n 30 \
+    --no-cnv \
+    -p "What is 2+2?"
+```
+
+**Indicadores de éxito en el output:**
+```
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA Tegra X1, compute capability 5.3, VMM: no
+load_tensors: offloaded 27/27 layers to GPU
+load_tensors:        CUDA0 model buffer size =  1548.29 MiB
+```
+
+**Indicadores de éxito en tegrastats:**
+```
+GR3D_FREQ 99%@921  ← GPU activo durante inferencia
+POM_5V_GPU 2256/1  ← consumo real del GPU
+```
+
+#### Paso 6 — Uso diario
+
+Para sesiones interactivas:
+
+```bash
+pkill -9 -f llama-cli 2>/dev/null; sleep 1
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+llama-cli --model "$MODEL" \
+    --n-gpu-layers 99 \
+    -c 512 \
+    -ub 64 \
+    -n 400 \
+    --temp 0.7
+```
+
+Para iniciar el servidor HTTP (API compatible OpenAI):
+
+```bash
+pkill -9 -f llama-server 2>/dev/null; sleep 1
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+llama-server \
+    --model "$MODEL" \
+    --n-gpu-layers 99 \
+    -c 512 \
+    -ub 64 \
+    --host 0.0.0.0 \
+    --port 8080 &
+
+echo "Servidor iniciado en http://$(hostname -I | awk '{print $1}'):8080"
+```
+
+Verificar que el servidor funciona:
+```bash
+curl -s http://localhost:8080/health
+# Retorna: {"status":"ok"}
+```
+
+---
+
+### Nota sobre Ollama
+
+Se recomienda mantener Ollama en la imagen. Aunque no puede usar GPU (por la incompatibilidad de CUDA 10.2 con Ollama moderno), cumple la función de gestor de modelos:
+
+```bash
+ollama list              # Ver modelos instalados
+ollama pull tinyllama    # Descargar nuevos modelos en GGUF
+ollama pull gemma2:2b    # Los guarda en /root/.ollama/models/blobs/
+```
+
+Los archivos GGUF descargados por Ollama son directamente usables por llama.cpp sin conversión.
+
+---
+
+*Referencia principal: https://gist.github.com/kreier/6871691130ec3ab907dd2815f9313c5d*  
+*Commit b5050 de llama.cpp: https://github.com/ggml-org/llama.cpp/tree/23106f94e*
+
+
+## **Fecha: 23/05/2026 — 24/05/2026** *(continuación)*
+
+Esta entrada documenta la integración definitiva de los hallazgos de la etapa anterior en el sistema de build de Yocto, de forma que la imagen generada incluya todos los prerequisitos necesarios para que llama.cpp con aceleración CUDA funcione desde el primer arranque, sin intervención manual más allá de ejecutar un único script de compilación.
+
+---
+
+### Punto de partida
+
+Al finalizar la etapa anterior se había logrado:
+- llama.cpp b5050 compilado en `/tmp/llama.cpp/` con soporte CUDA sm_53
+- GPU Maxwell al 99% durante inferencia (`GR3D_FREQ 99%@921`, `POM_5V_GPU 2256 mW`)
+- Inferencias funcionando con gemma2:2b vía `llama-cli`
+
+El proceso para llegar a ese estado requería intervención manual significativa:
+- SCP de ~800 headers CUDA desde el build host
+- Parche manual de `host_config.h`
+- Extracción e instalación de librerías estáticas desde un IPK
+- Descarga de cmake 3.26 y compilación on-device de ~85 minutos
+
+El objetivo de esta etapa fue incorporar todos esos pasos al pipeline de Yocto para que ninguno fuera necesario hacerlo a mano en la Jetson.
+
+---
+
+### 1. Creación del script setup-llama.sh y su inclusión en la imagen
+
+El primer intento fue incluir el script de compilación como un heredoc dentro de la función `install_setup_script` del bbappend. Esto generó un error de parseo de BitBake:
+
+```
+ERROR: ParseError at core-image-base.bbappend:173:
+unparsed line: 'log "=== Configurando llama.cpp ${LLAMA_COMMIT} con CUDA sm_53 ==="'
+```
+
+**Causa:** BitBake parsea el contenido de las funciones shell en busca de referencias `${VAR}`. Al encontrar `${LLAMA_COMMIT}` dentro del heredoc, lo trata como una variable BitBake no definida y falla. Los heredocs con scripts complejos no son seguros en bbappends.
+
+**Solución:** Separar el script en un archivo independiente en `meta-ai/recipes-core/images/files/setup-llama.sh`. La función `install_setup_script` simplemente lo copia al rootfs:
+
+```bash
+install_setup_script() {
+    install -d ${IMAGE_ROOTFS}/usr/local/bin
+    install -m 0755 ${LLAMA_SCRIPT} \
+        ${IMAGE_ROOTFS}/usr/local/bin/setup-llama.sh
+}
+```
+
+Para referenciar el archivo desde el bbappend sin depender de `${THISDIR}` (que en funciones shell apunta al directorio de la receta base, no del bbappend), se usa:
+
+```bitbake
+LLAMA_SCRIPT := "${@os.path.dirname(d.getVar('FILE'))}/files/setup-llama.sh"
+```
+
+`FILE` contiene el path del bbappend en tiempo de parseo. El operador `:=` fuerza evaluación inmediata, produciendo un path absoluto que se almacena como string fijo.
+
+**Problema adicional con THISDIR:** El run script generado por BitBake mostró que `${THISDIR}` en funciones shell se expande al directorio de la receta **base** (`meta/recipes-core/images/`), no al del bbappend (`meta-ai/recipes-core/images/`). Esto causó que `install` buscara el archivo en el lugar equivocado. La solución fue mantener una copia del script en ambos directorios o usar la variable `LLAMA_SCRIPT` basada en `FILE` como se describe arriba.
+
+---
+
+### 2. Problema -lstdc++fs: GCC 9.5 vs GCC 8.5
+
+Al compilar llama.cpp en la Jetson, el linker fallaba al 37% con:
+
+```
+cannot find -lstdc++fs
+```
+
+**Causa:** En GCC 8.x, `libstdc++fs` existe como librería separada para `std::filesystem`. En GCC 9.5+ está integrada en `libstdc++`. El parche del gist de referencia incluía `target_link_libraries(ggml PRIVATE stdc++fs)` diseñado para GCC 8.5 en Ubuntu. En la imagen Yocto con GCC 9.5, esa librería no existe.
+
+**Por qué ocurría pese a no estar en el parche del script:** cmake 3.26 puede agregar `-lstdc++fs` automáticamente al detectar uso de `std::filesystem`. Aparece en el Makefile generado aunque no se declare explícitamente.
+
+**Solución en setup-llama.sh:** Limpiar el flag del Makefile generado entre `cmake -B build` y `cmake --build build`:
+
+```bash
+cmake -B build [flags...]
+
+# Limpiar -lstdc++fs del Makefile generado (incompatible con GCC 9.5)
+find build/ -type f 2>/dev/null | \
+    xargs grep -l "stdc++fs" 2>/dev/null | \
+    while read f; do sed -i 's/-lstdc++fs//g' "$f"; done
+
+cmake --build build --config Release -j4
+```
+
+Este paso se realiza entre los dos cmake, de modo que los kernels CUDA ya compilados no necesitan recompilarse.
+
+---
+
+### 3. Problema THISDIR en ROOTFS_POSTPROCESS_COMMAND
+
+Cuando se usó `${THISDIR}/files/setup-llama.sh` directamente en la función de install, la ruta resuelta en el script generado fue:
+
+```
+/home/yoctouser/yocto-workspace/poky/meta/recipes-core/images/files/setup-llama.sh
+```
+
+En lugar de:
+
+```
+/home/yoctouser/yocto-workspace/poky/build/meta-ai/recipes-core/images/files/setup-llama.sh
+```
+
+**Causa:** `THISDIR` en el contexto de ejecución de las funciones de imagen apunta a la receta base (`meta/`), no al bbappend. Esto es un comportamiento conocido de BitBake.
+
+**Solución:** Definir `LLAMA_SCRIPT` con evaluación inmediata basada en `FILE` (el path del bbappend en tiempo de parseo) y mantener el archivo también en el directorio de la receta base para compatibilidad:
+
+```bash
+mkdir -p /home/yoctouser/yocto-workspace/poky/meta/recipes-core/images/files/
+cp meta-ai/recipes-core/images/files/setup-llama.sh \
+   /home/yoctouser/yocto-workspace/poky/meta/recipes-core/images/files/
+```
+
+---
+
+### 4. Headers CUDA incompletos: cublas_v2.h faltante
+
+Al correr `setup-llama.sh` en la nueva imagen, falló la compilación del primer archivo CUDA:
+
+```
+fatal error: cublas_v2.h: No such file or directory
+```
+
+**Causa:** El cambio de `cuda-nvcc-headers` a `cuda-cudart-dev` en `local.conf` proveyó `cuda_runtime.h` y las librerías estáticas, pero no `cublas_v2.h`. Este header pertenece al SDK de cuBLAS que en meta-tegra Dunfell no tiene un paquete `-dev` instalable separado. Los headers del SDK completo solo están disponibles en el `recipe-sysroot` del paquete `cuda-libraries` durante el proceso de build.
+
+**Solución:** En la función `fix_cuda_symlinks` del bbappend, copiar los headers desde el recipe-sysroot de `cuda-libraries` al rootfs de la imagen. Durante `do_rootfs`, ese directorio está disponible en el filesystem del host de build:
+
+```bash
+for _cuda_inc in ${TMPDIR}/work/*-poky-linux/cuda-libraries/*/recipe-sysroot/usr/local/cuda-10.2/include; do
+    if [ -d "${_cuda_inc}" ]; then
+        cp -rf "${_cuda_inc}/"* \
+            "${IMAGE_ROOTFS}/usr/local/cuda-10.2/include/" 2>/dev/null || true
+        bbnote "fix_cuda_symlinks: SDK CUDA completo copiado desde ${_cuda_inc}"
+        break
+    fi
+done
+```
+
+`${TMPDIR}` es expandido por BitBake al directorio `tmp/` del build. El glob `*-poky-linux/cuda-libraries/*/` encuentra la versión correcta independientemente del número de build.
+
+---
+
+### 5. host_config.h sobreescrito por el cp de headers
+
+Después de agregar la copia del SDK completo, el parche de `host_config.h` dejó de funcionar porque el `cp -rf` sobreescribía el archivo parcheado con la versión original del staging.
+
+**Solución:** Reordenar `fix_cuda_symlinks` para que el parche de `host_config.h` quede **siempre al final**, después de cualquier operación de copia:
+
+```bash
+# 1. Copiar SDK completo (puede sobreescribir host_config.h)
+for _cuda_inc in ${TMPDIR}/work/...; do
+    cp -rf "${_cuda_inc}/"* "${IMAGE_ROOTFS}/usr/local/cuda-10.2/include/"
+    break
+done
+
+# 2. Re-aplicar parche SIEMPRE al final
+HOST_CFG="${IMAGE_ROOTFS}/usr/local/cuda-10.2/include/crt/host_config.h"
+if [ -f "${HOST_CFG}" ]; then
+    sed -i 's/__GNUC__ > 8/__GNUC__ > 9/' "${HOST_CFG}"
+fi
+```
+
+---
+
+### 6. Binarios no instalados en PATH
+
+Tras la compilación exitosa, los binarios quedaban en `/opt/llama.cpp/build/bin/` pero no en ningún directorio del PATH:
+
+```
+-sh: llama-cli: command not found
+```
+
+**Solución:** El script `setup-llama.sh` incluye explícitamente el paso de instalación:
+
+```bash
+install -m 0755 build/bin/llama-cli    /usr/local/bin/llama-cli
+install -m 0755 build/bin/llama-server /usr/local/bin/llama-server
+install -m 0755 build/bin/llama-bench  /usr/local/bin/llama-bench
+```
+
+---
+
+### Estado final de la imagen
+
+La imagen generada con estos cambios incluye en el rootfs:
+
+- **~800 headers del SDK CUDA 10.2** (incluyendo `cublas_v2.h`, `cufft.h`, etc.)
+- **`host_config.h` parcheado** con `__GNUC__ > 9` para aceptar GCC 9.5
+- **Librerías estáticas** `libcudadevrt.a`, `libcudart_static.a` via `cuda-cudart-dev`
+- **Symlinks** `libcudart.so`, `libcublas.so` y `lib64 → lib`
+- **Stubs** `cuda_bf16.h`, `cuda_bf16.hpp`, `arm_bf16.h`
+- **Script** `/usr/local/bin/setup-llama.sh` listo para ejecutar
+
+---
+
+### Tutorial — Proceso definitivo de principio a fin
+
+#### Requisitos previos
+
+- Contenedor Docker con Yocto Dunfell activo
+- Acceso a internet desde la Jetson (Ethernet)
+- Tarjeta SD de al menos 16 GB
+
+---
+
+#### Paso 1 — Aplicar los cambios en Yocto (en el contenedor Docker)
+
+Verificar que `local.conf` tiene `cuda-cudart-dev` (no `cuda-nvcc-headers`):
+
+```bash
+grep "cuda-cudart" /home/yoctouser/yocto-workspace/poky/build/conf/local.conf
+# Debe mostrar: cuda-cudart-dev
+```
+
+Verificar que el bbappend tiene los dos bloques nuevos en `fix_cuda_symlinks`:
+
+```bash
+grep -c "TMPDIR.*cuda-libraries\|host_config.*GNUC.*9" \
+    /home/yoctouser/yocto-workspace/poky/build/meta-ai/recipes-core/images/core-image-base.bbappend
+# Debe mostrar: 2
+```
+
+Verificar que `setup-llama.sh` existe y tiene el check de `cublas_v2.h`:
+
+```bash
+grep "cublas_v2" \
+    /home/yoctouser/yocto-workspace/poky/build/meta-ai/recipes-core/images/files/setup-llama.sh
+# Debe mostrar la línea del prerequisito
+```
+
+Sincronizar a la receta base (necesario por el comportamiento de THISDIR):
+
+```bash
+mkdir -p /home/yoctouser/yocto-workspace/poky/meta/recipes-core/images/files/
+cp /home/yoctouser/yocto-workspace/poky/build/meta-ai/recipes-core/images/files/setup-llama.sh \
+   /home/yoctouser/yocto-workspace/poky/meta/recipes-core/images/files/
+```
+
+---
+
+#### Paso 2 — Construir la imagen
+
+```bash
+cd /home/yoctouser/yocto-workspace/poky/build
+bitbake core-image-base
+```
+
+Tiempo estimado: 15-30 minutos (la mayoría del trabajo ya está cacheado).
+
+**Verificar que los headers llegaron al rootfs antes de flashear:**
+
+```bash
+# cublas_v2.h debe estar presente
+find /home/yoctouser/yocto-workspace/poky/build/tmp/work/jetson_nano_devkit-poky-linux/core-image-base/1.0-r0/rootfs/usr/local/cuda-10.2/include -name "cublas_v2.h"
+
+# Debe haber 800+ headers
+find /home/yoctouser/yocto-workspace/poky/build/tmp/work/jetson_nano_devkit-poky-linux/core-image-base/1.0-r0/rootfs/usr/local/cuda-10.2/include -name "*.h" | wc -l
+
+# host_config.h debe tener el parche aplicado
+grep "__GNUC__.*[0-9]" \
+    /home/yoctouser/yocto-workspace/poky/build/tmp/work/jetson_nano_devkit-poky-linux/core-image-base/1.0-r0/rootfs/usr/local/cuda-10.2/include/crt/host_config.h
+# Debe mostrar: __GNUC__ > 9
+```
+
+---
+
+#### Paso 3 — Flashear la SD
+
+Revisar documento dedicado a esta etapa.
+
+---
+
+#### Paso 4 — Primer arranque: verificar prerequisitos
+
+Con la Jetson boooteada y Ethernet conectado:
+
+```bash
+# Verificar headers
+find /usr/local/cuda-10.2/include -name "cublas_v2.h"
+find /usr/local/cuda-10.2/include -name "*.h" | wc -l
+
+# Verificar parche GCC
+grep "GNUC" /usr/local/cuda-10.2/include/crt/host_config.h | grep "[0-9]"
+# Debe mostrar: __GNUC__ > 9
+
+# Verificar librerías estáticas
+ls /usr/local/cuda-10.2/lib/*.a
+
+# Verificar que el script está presente
+ls -lh /usr/local/bin/setup-llama.sh
+```
+
+Si los cuatro checks pasan, continuar al siguiente paso. Si `cublas_v2.h` falta o `host_config.h` no está parcheado, la imagen no se generó correctamente y hay que volver al paso 2.
+
+---
+
+#### Paso 5 — Compilar llama.cpp (único comando, ~85 minutos)
+
+```bash
+setup-llama.sh 2>&1 | tee /tmp/setup-llama-log.txt
+```
+
+El script ejecuta automáticamente:
+1. Verificación de prerequisitos CUDA
+2. Descarga de cmake 3.26.4 para ARM64
+3. Clone de llama.cpp al commit b5050 (`23106f94e`)
+4. Aplicación de 6 parches de compatibilidad CUDA 10.2 + GCC 9.5
+5. cmake con flags para sm_53 y runtime SHARED
+6. Limpieza de `-lstdc++fs` del Makefile generado
+7. Compilación con `-j4`
+8. Instalación de binarios en `/usr/local/bin/`
+
+El progreso de los kernels CUDA se ve como:
+
+```
+[  6%] Building CUDA object ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/acc.cu.o
+...
+[ 37%] Linking CUDA shared library ../../../bin/libggml-cuda.so
+[ 37%] Built target ggml-cuda
+...
+[100%] Built target llama-server
+[setup-llama] === Compilacion exitosa. Binarios en /usr/local/bin/ ===
+```
+
+---
+
+#### Paso 6 — Verificar GPU con inferencia
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+
+# Encontrar el modelo gemma2:2b
+MODEL=$(for f in /root/.ollama/models/blobs/*; do
+    echo "$(wc -c < $f 2>/dev/null) $f"
+done | sort -rn | head -1 | awk '{print $2}')
+
+# Prueba rápida
+llama-cli --model "$MODEL" --n-gpu-layers 99 -c 256 -ub 64 -n 30 \
+    -p "What is 2+2?"
+```
+
+**Indicadores de éxito en el output de arranque:**
+
+```
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA Tegra X1, compute capability 5.3, VMM: no
+load_tensors: offloaded 27/27 layers to GPU
+load_tensors:        CUDA0 model buffer size =  1548.29 MiB
+```
+
+**Indicadores de éxito en tegrastats** (ejecutar en otra terminal):
+
+```
+GR3D_FREQ 99%@921      ← GPU al 99%
+POM_5V_GPU 2256/1      ← GPU consumiendo ~2.3W
+```
+
+---
+
+#### Sesión de uso diario
+
+Para conversación interactiva:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+pkill -9 -f llama-cli 2>/dev/null; sleep 1
+
+llama-cli --model "$MODEL" --n-gpu-layers 99 -c 2048 -ub 64 -n 600 --temp 0.7
+```
+
+Para servidor HTTP (API compatible OpenAI):
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda-10.2/lib:/usr/lib:$LD_LIBRARY_PATH
+pkill -9 -f llama-server 2>/dev/null; sleep 1
+
+llama-server --model "$MODEL" --n-gpu-layers 99 \
+    -c 512 -ub 64 --host 0.0.0.0 --port 8080 &
+
+curl -s http://localhost:8080/health
+# Retorna: {"status":"ok"}
+```
+
+---
+
+*Referencia: https://gist.github.com/kreier/6871691130ec3ab907dd2815f9313c5d*
+*Commit b5050 de llama.cpp: https://github.com/ggml-org/llama.cpp/tree/23106f94e*
