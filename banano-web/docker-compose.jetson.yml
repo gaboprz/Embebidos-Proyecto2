@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  banano-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    container_name: banano-web
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - banano-network
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  banano-network:
+    driver: bridge
