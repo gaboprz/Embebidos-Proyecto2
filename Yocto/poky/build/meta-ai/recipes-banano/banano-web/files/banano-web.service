@@ -1,0 +1,15 @@
+[Unit]
+Description=Banano AI Web Backend
+After=network.target vision.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/banano-web
+ExecStart=python3 /opt/banano-web/backend/banano_diagnostico.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

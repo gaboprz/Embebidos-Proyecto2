@@ -1,0 +1,20 @@
+[Unit]
+Description=Vision AI Banana Disease Classifier
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+    if python3 -c "import onnxruntime" 2>/dev/null; then \
+        python3 -c "\
+import onnxruntime as ort; \
+s = ort.InferenceSession(\"/opt/vision/models/banana_disease_classifier.onnx\", providers=[\"CPUExecutionProvider\"]); \
+print(\"Vision AI: modelo cargado OK —\", s.get_inputs()[0].shape)"; \
+    else \
+        echo "Vision AI: onnxruntime no instalado — ejecutar setup-vision.sh"; \
+    fi'
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
